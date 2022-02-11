@@ -2,11 +2,10 @@ package neofs
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"io"
-	"math"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/base"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
+	"github.com/distribution/distribution/v3/registry/storage/driver/neofs/transformer"
 	"github.com/nspcc-dev/neo-go/cli/flags"
 	rpc "github.com/nspcc-dev/neo-go/pkg/rpc/client"
 	"github.com/nspcc-dev/neo-go/pkg/wallet"
@@ -33,21 +33,36 @@ const (
 	attributeMultipartName   = "Distribution-MultipartName"
 	attributeMultipartNumber = "Distribution-MultipartNumber"
 	multipartInitPartPrefix  = "init-part-"
+	attributeSHAState        = "sha256state"
+
+	defaultMaxObjectSize = 3145728 // 3 mb
 )
 
-//DriverParameters is a struct that encapsulates all of the driver parameters after all values have been set
+//DriverParameters is a struct that encapsulates all of the driver parameters after all values have been set.
 type DriverParameters struct {
-	Endpoint    string
-	ContainerID string
-	Wallet      string
-	Password    string
+	ContainerID               string
+	Peers                     []*PeerInfo
+	Wallet                    *Wallet
+	ConnectionTimeout         time.Duration
+	RequestTimeout            time.Duration
+	RebalanceInterval         time.Duration
+	SessionExpirationDuration uint64
+	RpcEndpoint               string
+	MaxObjectSize             uint64
+}
 
-	Address           string
-	ConnectionTimeout time.Duration
-	RequestTimeout    time.Duration
-	RebalanceInterval time.Duration
-	SessionExpiration uint64
-	RpcEndpoint       string
+// Wallet contains params to get key from wallet.
+type Wallet struct {
+	Path     string
+	Password string
+	Address  string
+}
+
+// PeerInfo contains node params.
+type PeerInfo struct {
+	Address  string
+	Weight   float64
+	Priority int
 }
 
 func init() {
@@ -62,7 +77,9 @@ func (n *neofsDriverFactory) Create(parameters map[string]interface{}) (storaged
 
 type driver struct {
 	sdkPool     pool.Pool
+	key         *ecdsa.PrivateKey
 	containerID *cid.ID
+	maxSize     uint64
 }
 
 type baseEmbed struct {
@@ -77,45 +94,37 @@ type Driver struct {
 
 // FromParameters constructs a new Driver with a given parameters map
 // Required parameters:
-// - endpoint
+// - peers
 // - wallet
-// - password
 // Optional Parameters:
 // - connection_timeout
 // - request_timeout
 // - rebalance_interval
-// - session_expiration
+// - session_expiration_duration
 // - rpc_endpoint
-// - address
+// - max_object_size
 func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
-	endpoint := parameters["endpoint"]
-	if endpoint == nil {
-		return nil, fmt.Errorf("no edpoint provided")
+	peers, err := parsePeers(parameters)
+	if err != nil {
+		return nil, err
 	}
 
-	wallet := parameters["wallet"]
-	if wallet == nil {
-		return nil, fmt.Errorf("no wallet provided")
+	walletInfo, err := parseWallet(parameters)
+	if err != nil {
+		return nil, err
 	}
 
-	password := parameters["password"]
-	if password == nil {
-		return nil, fmt.Errorf("no password provided")
-	}
-
-	containerID := parameters["container"]
-	if containerID == nil {
+	containerID, ok := parameters["container"].(string)
+	if !ok {
 		return nil, fmt.Errorf("no container provided")
 	}
 
-	address := parameters["address"]
-	if address == nil {
-		address = ""
-	}
-
-	rpcEndpoint := parameters["rpc_endpoint"]
-	if rpcEndpoint == nil {
-		rpcEndpoint = ""
+	var rpcEndpoint string
+	rpcEndpointParam := parameters["rpc_endpoint"]
+	if rpcEndpointParam != nil {
+		if rpcEndpoint, ok = rpcEndpointParam.(string); !ok {
+			return nil, fmt.Errorf("invalid rpc_endpoint param")
+		}
 	}
 
 	connectionTimeout, err := parseTimeout(parameters, "connection_timeout", 4*time.Second)
@@ -128,30 +137,113 @@ func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDri
 		return nil, err
 	}
 
-	rebalanceInterval, err := parseTimeout(parameters, "rebalance_interval", 30*time.Second)
+	rebalanceInterval, err := parseTimeout(parameters, "rebalance_interval", 20*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	expiration, err := parseExpiration(parameters, "session_expiration", math.MaxUint64)
+	expiration, err := parseUInt64(parameters, "session_expiration_duration", 0)
+	if err != nil {
+		return nil, err
+	}
+
+	maxSize, err := parseUInt64(parameters, "max_object_size", defaultMaxObjectSize)
 	if err != nil {
 		return nil, err
 	}
 
 	params := DriverParameters{
-		Endpoint:          fmt.Sprint(endpoint),
-		ContainerID:       fmt.Sprint(containerID),
-		Wallet:            fmt.Sprint(wallet),
-		Password:          fmt.Sprint(password),
-		Address:           fmt.Sprint(address),
-		ConnectionTimeout: connectionTimeout,
-		RequestTimeout:    requestTimeout,
-		RebalanceInterval: rebalanceInterval,
-		SessionExpiration: expiration,
-		RpcEndpoint:       fmt.Sprint(rpcEndpoint),
+		Peers:                     peers,
+		ContainerID:               containerID,
+		Wallet:                    walletInfo,
+		ConnectionTimeout:         connectionTimeout,
+		RequestTimeout:            requestTimeout,
+		RebalanceInterval:         rebalanceInterval,
+		SessionExpirationDuration: expiration,
+		RpcEndpoint:               rpcEndpoint,
+		MaxObjectSize:             maxSize,
 	}
 
 	return New(params)
+}
+
+func parseWallet(parameters map[string]interface{}) (*Wallet, error) {
+	walletInfo := new(Wallet)
+
+	walletParams, ok := parameters["wallet"].(map[interface{}]interface{})
+	if !ok {
+		return nil, fmt.Errorf("no wallet params provided")
+	}
+
+	walletInfo.Path, ok = walletParams["path"].(string)
+	if !ok {
+		return nil, fmt.Errorf("no path provided")
+	}
+
+	walletInfo.Password, ok = walletParams["password"].(string)
+	if !ok {
+		return nil, fmt.Errorf("no password provided")
+	}
+
+	addressParam := walletParams["address"]
+	if addressParam != nil {
+		if walletInfo.Address, ok = addressParam.(string); !ok {
+			return nil, fmt.Errorf("invalid address param")
+		}
+	}
+
+	return walletInfo, nil
+}
+
+func parsePeers(parameters map[string]interface{}) ([]*PeerInfo, error) {
+	poolParams, ok := parameters["peers"].(map[interface{}]interface{})
+	if !ok {
+		return nil, fmt.Errorf("no peers params provided")
+	}
+
+	var peers []*PeerInfo
+	for _, val := range poolParams {
+		peerInfo, ok := val.(map[interface{}]interface{})
+		if !ok {
+			return nil, fmt.Errorf("invalid peers params")
+		}
+
+		peer := new(PeerInfo)
+
+		peer.Address, ok = peerInfo["address"].(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid peer address")
+		}
+
+		weightParam := peerInfo["weight"]
+		if weightParam != nil {
+
+			switch weight := weightParam.(type) {
+			case int:
+				peer.Weight = float64(weight)
+			case float64:
+				peer.Weight = weight
+			default:
+				return nil, fmt.Errorf("invalid weight param")
+			}
+			if peer.Weight <= 0 {
+				peer.Weight = 1
+			}
+		}
+
+		priorityParam := peerInfo["priority"]
+		if priorityParam != nil {
+			if peer.Priority, ok = priorityParam.(int); !ok {
+				return nil, fmt.Errorf("invalid priority param")
+			} else if peer.Priority <= 0 {
+				peer.Priority = 1
+			}
+		}
+
+		peers = append(peers, peer)
+	}
+
+	return peers, nil
 }
 
 func parseTimeout(parameters map[string]interface{}, name string, defaultValue time.Duration) (time.Duration, error) {
@@ -160,21 +252,33 @@ func parseTimeout(parameters map[string]interface{}, name string, defaultValue t
 		return defaultValue, nil
 	}
 
-	if timeout, ok := timeoutValue.(time.Duration); ok {
+	switch val := timeoutValue.(type) {
+	case int:
+		return time.Duration(val), nil
+	case int64:
+		return time.Duration(val), nil
+	case string:
+		timeout, err := time.ParseDuration(val)
+		if err != nil {
+			return 0, fmt.Errorf("couldn't parse duration '%s': %w", val, err)
+		}
 		return timeout, nil
 	}
 
 	return 0, fmt.Errorf("invalid %s", name)
 }
 
-func parseExpiration(parameters map[string]interface{}, name string, defaultValue uint64) (uint64, error) {
+func parseUInt64(parameters map[string]interface{}, name string, defaultValue uint64) (uint64, error) {
 	expirationValue := parameters[name]
 	if expirationValue == nil {
 		return defaultValue, nil
 	}
 
-	if expiration, ok := expirationValue.(uint64); ok {
-		return expiration, nil
+	switch val := expirationValue.(type) {
+	case int:
+		return uint64(val), nil
+	case int64:
+		return uint64(val), nil
 	}
 
 	return 0, fmt.Errorf("invalid %s", name)
@@ -184,7 +288,12 @@ func parseExpiration(parameters map[string]interface{}, name string, defaultValu
 func New(params DriverParameters) (*Driver, error) {
 	ctx := context.Background()
 
-	sdkPool, err := createPool(ctx, params)
+	acc, err := getAccount(params.Wallet)
+	if err != nil {
+		return nil, err
+	}
+
+	sdkPool, err := createPool(ctx, acc, params)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create sdk pool: %w", err)
 	}
@@ -196,7 +305,9 @@ func New(params DriverParameters) (*Driver, error) {
 
 	d := &driver{
 		sdkPool:     sdkPool,
+		key:         &acc.PrivateKey().PrivateKey,
 		containerID: cnrID,
+		maxSize:     params.MaxObjectSize,
 	}
 
 	return &Driver{
@@ -226,21 +337,19 @@ func getContainerID(ctx context.Context, params DriverParameters) (*cid.ID, erro
 	return cnrID, nil
 }
 
-func createPool(ctx context.Context, param DriverParameters) (pool.Pool, error) {
+func createPool(ctx context.Context, acc *wallet.Account, param DriverParameters) (pool.Pool, error) {
 	pb := new(pool.Builder)
-	pb.AddNode(param.Endpoint, 1, 1)
 
-	acc, err := getAccount(param)
-	if err != nil {
-		return nil, err
+	for _, peer := range param.Peers {
+		pb.AddNode(peer.Address, peer.Priority, peer.Weight)
 	}
 
 	opts := &pool.BuilderOptions{
-		Key:                     &acc.PrivateKey().PrivateKey,
-		NodeConnectionTimeout:   param.ConnectionTimeout,
-		NodeRequestTimeout:      param.RequestTimeout,
-		ClientRebalanceInterval: param.RebalanceInterval,
-		SessionExpirationEpoch:  param.SessionExpiration,
+		Key:                       &acc.PrivateKey().PrivateKey,
+		NodeConnectionTimeout:     param.ConnectionTimeout,
+		NodeRequestTimeout:        param.RequestTimeout,
+		ClientRebalanceInterval:   param.RebalanceInterval,
+		SessionExpirationDuration: param.SessionExpirationDuration,
 	}
 
 	return pb.Build(ctx, opts)
@@ -261,21 +370,21 @@ func createNnsResolver(ctx context.Context, params DriverParameters) (resolver.N
 	return resolver.NewNNSResolver(cli)
 }
 
-func getAccount(param DriverParameters) (*wallet.Account, error) {
-	w, err := wallet.NewWalletFromFile(param.Wallet)
+func getAccount(walletInfo *Wallet) (*wallet.Account, error) {
+	w, err := wallet.NewWalletFromFile(walletInfo.Path)
 	if err != nil {
 		return nil, err
 	}
 
 	addr := w.GetChangeAddress()
-	if param.Address != "" {
-		addr, err = flags.ParseAddress(param.Address)
+	if walletInfo.Address != "" {
+		addr, err = flags.ParseAddress(walletInfo.Address)
 		if err != nil {
 			return nil, fmt.Errorf("invalid address")
 		}
 	}
 	acc := w.GetAccount(addr)
-	err = acc.Decrypt(param.Password, w.Scrypt)
+	err = acc.Decrypt(walletInfo.Password, w.Scrypt)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +457,6 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 	}
 
 	return obj.Payload(), nil
-
 }
 
 func (d *driver) PutContent(ctx context.Context, path string, content []byte) error {
@@ -397,79 +505,90 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 	return pr, nil
 }
 
+func getUploadUUID(ctx context.Context) (uuid string) {
+	return dcontext.GetStringValue(ctx, "vars.uuid")
+}
+
 func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
-	id, err := d.searchInitPart(ctx, path)
-	if err != nil {
-		if !append && isErrPathNotFound(err) {
-			rawObject := d.rawInitPartObject(path)
-			p := new(client.PutObjectParams).WithObject(rawObject.Object())
-			id, err = d.sdkPool.PutObject(ctx, p)
-			if err != nil {
-				return nil, fmt.Errorf("couldn't put init part object '%s': %w", path, err)
-			}
-			dcontext.GetLogger(ctx).Warnf("new writer init '%s'", path)
-			return d.newWriter(ctx, path, id, nil), nil
-		}
-		return nil, fmt.Errorf("couldn't find init part for path '%s': %w", path, err)
-	} else if !append {
-		return nil, fmt.Errorf("init upload part '%s' already exist, id '%s'", path, id)
+	splitID := object.NewSplitID()
+	uploadUUID := getUploadUUID(ctx)
+	if err := splitID.Parse(uploadUUID); err != nil {
+		return nil, fmt.Errorf("couldn't parse split id as upload uuid '%s': %w", uploadUUID, err)
 	}
 
-	ids, err := d.searchParts(ctx, path)
+	ids, err := d.searchSplitParts(ctx, splitID)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't search parts '%s': %w", path, err)
+		return nil, fmt.Errorf("couldn't search split parts '%s': %w", path, err)
 	}
 
-	objects := make([]*object.Object, len(ids))
+	if !append && len(ids) > 0 {
+		return nil, fmt.Errorf("init upload part '%s' already exist, splitID '%s'", path, splitID)
+	}
+
+	splitInfo := object.NewSplitInfo()
+	splitInfo.SetSplitID(splitID)
+
+	noChild := make(map[string]struct{}, len(ids))
+
+	parts := make([]*object.Object, len(ids))
 	for i, id := range ids {
 		p := new(client.ObjectHeaderParams).WithAddress(d.objectAddress(id))
 		obj, err := d.sdkPool.GetObjectHeader(ctx, p)
 		if err != nil {
-			return nil, fmt.Errorf("couldn't head object part '%s', id '%s': %w", path, id, err)
+			return nil, fmt.Errorf("couldn't head object part '%s', id '%s', splitID '%s': %w", path, id, splitID, err)
 		}
-		objects[i] = obj
+		parts[i] = obj
+		noChild[obj.ID().String()] = struct{}{}
 	}
-	dcontext.GetLogger(ctx).Warnf("new writer append '%s', objects %d", path, len(ids))
-	return d.newWriter(ctx, path, id, objects), nil
-}
 
-func isErrPathNotFound(err error) bool {
-	if err == nil {
-		return false
+	for _, obj := range parts {
+		if obj.Parent() != nil {
+			return nil, fmt.Errorf("object already exist '%s'", path)
+		}
+
+		delete(noChild, obj.PreviousID().String())
 	}
-	switch err.(type) {
-	case storagedriver.PathNotFoundError:
-		return true
+
+	if len(noChild) > 1 {
+		return nil, fmt.Errorf("couldn't find last part '%s'", path)
 	}
-	return false
+
+	for key := range noChild {
+		lastPartID := oid.NewID()
+		if err = lastPartID.Parse(key); err != nil {
+			return nil, fmt.Errorf("couldn't parse last part id '%s': %w", key, err)
+		}
+		splitInfo.SetLastPart(lastPartID)
+	}
+
+	wrtr, err := NewSizeLimiterWriter(ctx, d, path, splitInfo, parts)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't init size limiter writer: %w", err)
+	}
+
+	return wrtr, nil
 }
 
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-	if path == "/" {
+	if path == "/" { // healthcheck
+		if _, _, err := d.sdkPool.Connection(); err != nil {
+			return nil, fmt.Errorf("healthcheck failed: %w", err)
+		}
 		return newFileInfoDir(path), nil
 	}
 
-	ids, err := d.searchByPrefix(ctx, path)
+	id, err := d.searchOne(ctx, path)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't search objects '%s': %w", path, err)
+		return nil, err
 	}
 
-	if len(ids) > 0 {
-		for _, id := range ids {
-			p := new(client.ObjectHeaderParams).WithAddress(d.objectAddress(id))
-			obj, err := d.sdkPool.GetObjectHeader(ctx, p)
-			if err != nil {
-				return nil, fmt.Errorf("couldn't get object '%s': %w", id, err)
-			}
-
-			fileInf := newFileInfo(ctx, obj)
-			if fileInf.Path() == path {
-				return fileInf, nil
-			}
-		}
+	p := new(client.ObjectHeaderParams).WithAddress(d.objectAddress(id))
+	obj, err := d.sdkPool.GetObjectHeader(ctx, p)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't get object '%s': %w", id, err)
 	}
 
-	return newFileInfoDir(path), nil
+	return newFileInfo(ctx, obj), nil
 }
 
 func (d *driver) List(ctx context.Context, path string) ([]string, error) {
@@ -488,7 +607,7 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 		}
 
 		fileInf := newFileInfo(ctx, obj)
-		if filepath.Dir(fileInf.Path()) == path { //todo check trailing slash
+		if filepath.Dir(fileInf.Path()) == path {
 			result = append(result, fileInf.Path())
 		}
 	}
@@ -605,6 +724,15 @@ func (d *driver) searchParts(ctx context.Context, path string) ([]*oid.ID, error
 	return d.sdkPool.SearchObject(ctx, p)
 }
 
+func (d *driver) searchSplitParts(ctx context.Context, splitID *object.SplitID) ([]*oid.ID, error) {
+	filters := object.NewSearchFilters()
+	filters.AddPhyFilter()
+	filters.AddSplitIDFilter(object.MatchStringEqual, splitID)
+
+	p := new(client.SearchObjectParams).WithContainerID(d.containerID).WithSearchFilters(filters)
+	return d.sdkPool.SearchObject(ctx, p)
+}
+
 func (d *driver) searchInitPart(ctx context.Context, path string) (*oid.ID, error) {
 	path = multipartInitPartPrefix + path
 	ids, err := d.searchParts(ctx, path)
@@ -635,283 +763,107 @@ func handleSearchResponse(path string, ids []*oid.ID, err error) (*oid.ID, error
 	return ids[0], nil
 }
 
-type fileInfo struct {
-	path    string
-	size    int64
-	modTime time.Time
-	isDir   bool
-}
-
-func (f *fileInfo) Path() string {
-	return f.path
-}
-
-func (f *fileInfo) Size() int64 {
-	return f.size
-}
-
-func (f *fileInfo) ModTime() time.Time {
-	return f.modTime
-}
-
-func (f *fileInfo) IsDir() bool {
-	return f.isDir
-}
-
-func newFileInfo(ctx context.Context, obj *object.Object) *fileInfo {
-	fileInf := &fileInfo{
-		size: int64(obj.PayloadSize()),
+func newFileInfo(ctx context.Context, obj *object.Object) storagedriver.FileInfo {
+	fileInfoFields := storagedriver.FileInfoFields{
+		Size: int64(obj.PayloadSize()),
 	}
 
 	for _, attr := range obj.Attributes() {
 		switch attr.Key() {
 		case attributeFilePath:
-			fileInf.path = attr.Value()
+			fileInfoFields.Path = attr.Value()
 		case object.AttributeTimestamp:
 			timestamp, err := strconv.ParseInt(attr.Value(), 10, 64)
 			if err != nil {
 				dcontext.GetLogger(ctx).Warnf("object '%s' has invalid timestamp '%s'", obj.ID(), attr.Value())
 				continue
 			}
-			fileInf.modTime = time.Unix(timestamp, 0)
+			fileInfoFields.ModTime = time.Unix(timestamp, 0)
 		}
 	}
 
-	return fileInf
+	return storagedriver.FileInfoInternal{FileInfoFields: fileInfoFields}
 }
 
-func newFileInfoDir(path string) *fileInfo {
-	return &fileInfo{
-		path:    path,
-		modTime: time.Now(),
-		isDir:   true,
-	}
-}
-
-type partInfo struct {
-	*fileInfo
-	number string
-	id     *oid.ID
-}
-
-func newPartInfo(ctx context.Context, obj *object.Object) *partInfo {
-	part := &partInfo{
-		fileInfo: newFileInfo(ctx, obj),
-		id:       obj.ID(),
-	}
-
-	for _, attr := range obj.Attributes() {
-		switch attr.Key() {
-		case attributeMultipartNumber:
-			part.number = attr.Value()
-		case attributeMultipartName:
-			part.path = attr.Value()
-		}
-	}
-
-	return part
-}
-
-type putPartResult struct {
-	id  *oid.ID
-	err error
-}
-
-type writer struct {
-	ctx            context.Context
-	driver         *driver
-	path           string
-	size           int64
-	initPartID     *oid.ID
-	objects        []*object.Object
-	nextObjWriter  io.WriteCloser
-	putPartChannel chan *putPartResult
-
-	closed    bool
-	committed bool
-	cancelled bool
-}
-
-func (d *driver) newWriter(ctx context.Context, path string, initPartID *oid.ID, objects []*object.Object) storagedriver.FileWriter {
-	var size uint64
-	for _, obj := range objects {
-		size += obj.PayloadSize()
-	}
-
-	return &writer{
-		ctx:        ctx,
-		driver:     d,
-		path:       path,
-		size:       int64(size),
-		objects:    objects,
-		initPartID: initPartID,
+func newFileInfoDir(path string) storagedriver.FileInfo {
+	return storagedriver.FileInfoInternal{
+		FileInfoFields: storagedriver.FileInfoFields{
+			Path:    path,
+			ModTime: time.Now(),
+			IsDir:   true,
+		},
 	}
 }
 
-func (w *writer) Write(data []byte) (int, error) {
-	if w.closed {
-		return 0, fmt.Errorf("already closed")
-	} else if w.committed {
-		return 0, fmt.Errorf("already committed")
-	} else if w.cancelled {
-		return 0, fmt.Errorf("already cancelled")
+func (d *driver) newObjTarget(ctx context.Context) transformer.ObjectTarget {
+	return &objTarget{
+		ctx:     ctx,
+		sdkPool: d.sdkPool,
+		key:     d.key,
 	}
-
-	if w.nextObjWriter == nil {
-		pr, pw := io.Pipe()
-		w.nextObjWriter = pw
-		w.putPartChannel = make(chan *putPartResult)
-		go func() {
-			defer close(w.putPartChannel)
-
-			rawObject := w.driver.rawPartObject(w.path, len(w.objects))
-			p := new(client.PutObjectParams).WithObject(rawObject.Object()).WithPayloadReader(pr)
-			res := new(putPartResult)
-			res.id, res.err = w.driver.sdkPool.PutObject(w.ctx, p)
-			w.putPartChannel <- res
-		}()
-	}
-
-	n, err := w.nextObjWriter.Write(data)
-	w.size += int64(n)
-	return n, err
 }
 
-func (w *writer) Close() error {
-	if w.closed {
-		return fmt.Errorf("already closed")
-	}
-	w.closed = true
-	dcontext.GetLogger(w.ctx).Warnf("closing writer '%s', objs %d, size %d", w.path, len(w.objects), w.size)
-	if w.nextObjWriter != nil {
-		if err := w.nextObjWriter.Close(); err != nil {
-			return err
-		}
+type objTarget struct {
+	ctx     context.Context
+	sdkPool pool.Pool
+	key     *ecdsa.PrivateKey
+	obj     *object.RawObject
+	chunks  [][]byte
+}
 
-		putPartRes := <-w.putPartChannel
-		if putPartRes.err != nil {
-			return putPartRes.err
-		}
-
-		ph := new(client.ObjectHeaderParams).WithAddress(w.driver.objectAddress(putPartRes.id))
-		obj, err := w.driver.sdkPool.GetObjectHeader(w.ctx, ph)
-		if err != nil {
-			return fmt.Errorf("couldn't head part after put '%s', id '%s': %w", w.path, putPartRes.id, err)
-		}
-		w.objects = append(w.objects, obj)
-	}
+func (t *objTarget) WriteHeader(obj *object.RawObject) error {
+	t.obj = obj
 	return nil
 }
 
-func (w *writer) Size() int64 {
-	return w.size
+func (t *objTarget) Write(p []byte) (n int, err error) {
+	t.chunks = append(t.chunks, p)
+	return len(p), nil
 }
 
-func (w *writer) Cancel() error {
-	if w.closed {
-		return fmt.Errorf("already closed")
-	} else if w.committed {
-		return fmt.Errorf("already committed")
+func (t *objTarget) Close() (*transformer.AccessIdentifiers, error) {
+	var (
+		parID  *oid.ID
+		parHdr *object.Object
+	)
+
+	sz := 0
+	for i := range t.chunks {
+		sz += len(t.chunks[i])
 	}
-	w.cancelled = true
+	t.obj.SetPayloadSize(uint64(sz))
 
-	return w.deleteParts()
-}
+	if par := t.obj.Parent(); par != nil && par.Signature() == nil {
+		rawPar := object.NewRawFromV2(par.ToV2())
 
-func (w *writer) deleteParts() error {
-	for _, obj := range w.objects {
-		if err := w.driver.delete(w.ctx, obj.ID()); err != nil {
-			return fmt.Errorf("couldn't delete object by path '%s': %w", w.path, err)
+		if err := object.SetIDWithSignature(t.key, rawPar); err != nil {
+			return nil, fmt.Errorf("could not finalize parent object: %w", err)
 		}
+
+		parID = rawPar.ID()
+		parHdr = rawPar.Object()
+
+		t.obj.SetParent(parHdr)
 	}
 
-	if err := w.driver.delete(w.ctx, w.initPartID); err != nil {
-		return fmt.Errorf("couldn't delete object by path '%s': %w", w.path, err)
+	if err := object.SetIDWithSignature(t.key, t.obj); err != nil {
+		return nil, fmt.Errorf("could not finalize object: %w", err)
 	}
 
-	return nil
-}
-
-func (w *writer) Commit() error {
-	if w.closed {
-		return fmt.Errorf("already closed")
-	} else if w.committed {
-		return fmt.Errorf("already committed")
-	} else if w.cancelled {
-		return fmt.Errorf("already cancelled")
+	payload := make([]byte, 0, sz)
+	for i := range t.chunks {
+		payload = append(payload, t.chunks[i]...)
 	}
-	w.committed = true
-	if err := w.Close(); err != nil {
-		return fmt.Errorf("couldn't close writer '%s': %w", w.path, err)
-	}
-	dcontext.GetLogger(w.ctx).Warnf("commiting '%s'", w.path)
+	t.obj.SetPayload(payload)
 
-	errCh := make(chan error)
-	pr, pw := io.Pipe()
-
-	go func() {
-		rawObject := w.driver.rawObject(w.path)
-		p := new(client.PutObjectParams).WithObject(rawObject.Object()).WithPayloadReader(pr)
-		_, err := w.driver.sdkPool.PutObject(w.ctx, p)
-		errCh <- err
-		close(errCh)
-	}()
-
-	for _, id := range w.orderedParts() {
-		p := new(client.GetObjectParams).WithAddress(w.driver.objectAddress(id)).WithPayloadWriter(pw)
-		if _, err := w.driver.sdkPool.GetObject(w.ctx, p); err != nil {
-			_ = pw.CloseWithError(err)
-			return fmt.Errorf("couldn't commit object '%s' because of read from part '%s' fails: %w", w.path, id, err)
-		}
-	}
-	_ = pw.Close()
-
-	if err := <-errCh; err != nil {
-		return fmt.Errorf("couldn't commit object '%s': %w", w.path, err)
-	}
-	return w.deleteParts()
-}
-
-func (w *writer) orderedParts() []*oid.ID {
-	parts := make([]*partInfo, len(w.objects))
-	for i, obj := range w.objects {
-		parts[i] = newPartInfo(w.ctx, obj)
-	}
-
-	sort.Slice(parts, func(i, j int) bool {
-		if parts[i].number == parts[j].number {
-			return parts[i].modTime.Before(parts[j].modTime)
-		}
-		return parts[i].number < parts[j].number
-	})
-
-	ids := make([]*oid.ID, 0, len(parts))
-	for _, part := range parts {
-		ids = append(ids, part.id)
-	}
-
-	return ids
-}
-
-func (w *writer) updateObjects() error {
-	ids, err := w.driver.searchParts(w.ctx, w.path)
+	p := new(client.PutObjectParams).WithObject(t.obj.Object())
+	_, err := t.sdkPool.PutObject(t.ctx, p)
 	if err != nil {
-		return fmt.Errorf("couldn't search parts '%s': %w", w.path, err)
+		return nil, fmt.Errorf("couldn't put part: %w", err)
 	}
 
-	var size uint64
-	objects := make([]*object.Object, len(ids))
-	for i, id := range ids {
-		p := new(client.ObjectHeaderParams).WithAddress(w.driver.objectAddress(id))
-		obj, err := w.driver.sdkPool.GetObjectHeader(w.ctx, p)
-		if err != nil {
-			return fmt.Errorf("couldn't head object part '%s', id '%s': %w", w.path, id, err)
-		}
-		objects[i] = obj
-		size += obj.PayloadSize()
-	}
-
-	w.objects = objects
-	w.size = int64(size)
-	return nil
+	return new(transformer.AccessIdentifiers).
+		WithSelfID(t.obj.ID()).
+		WithParentID(parID).
+		WithParent(parHdr), nil
 }
