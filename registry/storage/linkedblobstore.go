@@ -306,7 +306,7 @@ func (lbs *linkedBlobStore) mount(ctx context.Context, sourceRepo reference.Name
 
 // newBlobUpload allocates a new upload controller with the given state.
 func (lbs *linkedBlobStore) newBlobUpload(ctx context.Context, uuid, path string, startedAt time.Time, append bool) (distribution.BlobWriter, error) {
-	fw, err := lbs.driver.Writer(ctx, path, append)
+	fw, err := lbs.driver.Writer(context.WithValue(ctx, "vars.uuid", uuid), path, append)
 	if err != nil {
 		return nil, err
 	}
