@@ -1,0 +1,91 @@
+version: 0.1
+log:
+  level: debug
+  fields:
+    service: registry
+    environment: development
+  hooks:
+    - type: mail
+      disabled: true
+      levels:
+        - panic
+      options:
+        smtp:
+          addr: mail.example.com:25
+          username: mailuser
+          password: password
+          insecure: true
+        from: sender@example.com
+        to:
+          - errors@example.com
+storage:
+    delete:
+      enabled: true
+    cache:
+        blobdescriptor: inmemory
+    maintenance:
+      uploadpurging:
+        enabled: false
+    neofs:
+      wallet:
+        path: /home/user/github/nspcc/neofs-dev-env/wallets/wallet.json
+        password: ""
+      peers:
+        0:
+          address: s01.neofs.devenv:8080
+          weight: 1
+          priority: 1
+        1:
+          address: s02.neofs.devenv:8080
+          weight: 1
+          priority: 1
+      # container can be nicename (rpc_endpoint is required)
+      container: A8cfsuT1cBi46Carks9kqbVULwoQiJfif2JVozf3nb4j
+      # the following params are optional
+      max_object_size: 3145728 # 3mb
+      session_expiration_duration: 1000 # in blocks
+      connection_timeout: 5s
+      request_timeout: 5s
+      rebalance_interval: 30s
+      rpc_endpoint: http://morph_chain.neofs.devenv:30333
+http:
+    addr: :5000
+    debug:
+        addr: :5001
+        prometheus:
+            enabled: true
+            path: /metrics
+    headers:
+        X-Content-Type-Options: [nosniff]
+redis:
+  addr: localhost:6379
+  pool:
+    maxidle: 16
+    maxactive: 64
+    idletimeout: 300s
+  dialtimeout: 10ms
+  readtimeout: 10ms
+  writetimeout: 10ms
+notifications:
+    events:
+        includereferences: true
+    endpoints:
+        - name: local-5003
+          url: http://localhost:5003/callback
+          headers:
+             Authorization: [Bearer <an example token>]
+          timeout: 1s
+          threshold: 10
+          backoff: 1s
+          disabled: true
+        - name: local-8083
+          url: http://localhost:8083/callback
+          timeout: 1s
+          threshold: 10
+          backoff: 1s
+          disabled: true 
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
