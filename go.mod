@@ -20,7 +20,7 @@ require (
 	github.com/ncw/swift v1.0.47
 	github.com/nspcc-dev/neo-go v0.98.1
 	github.com/nspcc-dev/neo-go/examples/nft-nd-nns v0.0.0-20220204081622-62602af34544 // indirect
-	github.com/nspcc-dev/neofs-sdk-go v0.0.0-20220201141054-6a7ba33b59ef
+	github.com/nspcc-dev/neofs-sdk-go v0.0.0-20220211112159-40aaaafc73a6
 	github.com/nspcc-dev/tzhash v1.5.2
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.0.2
