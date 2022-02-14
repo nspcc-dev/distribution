@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	dcontext "github.com/distribution/distribution/v3/context"
@@ -29,13 +31,27 @@ import (
 const (
 	driverName = "neofs"
 
-	attributeFilePath        = "FilePath"
-	attributeMultipartName   = "Distribution-MultipartName"
-	attributeMultipartNumber = "Distribution-MultipartNumber"
-	multipartInitPartPrefix  = "init-part-"
-	attributeSHAState        = "sha256state"
+	attributeFilePath = "FilePath"
+	attributeSHAState = "sha256state"
 
 	defaultMaxObjectSize = 3145728 // 3 mb
+)
+
+const (
+	paramPeers                     = "peers"
+	paramAddress                   = "address"
+	paramWeight                    = "weight"
+	paramPriority                  = "priority"
+	paramWallet                    = "wallet"
+	paramPath                      = "path"
+	paramPassword                  = "password"
+	paramContainer                 = "container"
+	paramConnectionTimeout         = "connection_timeout"
+	paramRequestTimeout            = "request_timeout"
+	paramRebalanceInterval         = "rebalance_interval"
+	paramSessionExpirationDuration = "session_expiration_duration"
+	paramRpcEndpoint               = "rpc_endpoint"
+	paramMaxObjectSize             = "max_object_size"
 )
 
 //DriverParameters is a struct that encapsulates all of the driver parameters after all values have been set.
@@ -114,40 +130,40 @@ func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDri
 		return nil, err
 	}
 
-	containerID, ok := parameters["container"].(string)
+	containerID, ok := parameters[paramContainer].(string)
 	if !ok {
 		return nil, fmt.Errorf("no container provided")
 	}
 
 	var rpcEndpoint string
-	rpcEndpointParam := parameters["rpc_endpoint"]
+	rpcEndpointParam := parameters[paramRpcEndpoint]
 	if rpcEndpointParam != nil {
 		if rpcEndpoint, ok = rpcEndpointParam.(string); !ok {
 			return nil, fmt.Errorf("invalid rpc_endpoint param")
 		}
 	}
 
-	connectionTimeout, err := parseTimeout(parameters, "connection_timeout", 4*time.Second)
+	connectionTimeout, err := parseTimeout(parameters, paramConnectionTimeout, 4*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	requestTimeout, err := parseTimeout(parameters, "request_timeout", 4*time.Second)
+	requestTimeout, err := parseTimeout(parameters, paramRequestTimeout, 4*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	rebalanceInterval, err := parseTimeout(parameters, "rebalance_interval", 20*time.Second)
+	rebalanceInterval, err := parseTimeout(parameters, paramRebalanceInterval, 20*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	expiration, err := parseUInt64(parameters, "session_expiration_duration", 0)
+	expiration, err := parseUInt64(parameters, paramSessionExpirationDuration, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	maxSize, err := parseUInt64(parameters, "max_object_size", defaultMaxObjectSize)
+	maxSize, err := parseUInt64(parameters, paramMaxObjectSize, defaultMaxObjectSize)
 	if err != nil {
 		return nil, err
 	}
@@ -170,22 +186,22 @@ func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDri
 func parseWallet(parameters map[string]interface{}) (*Wallet, error) {
 	walletInfo := new(Wallet)
 
-	walletParams, ok := parameters["wallet"].(map[interface{}]interface{})
+	walletParams, ok := parameters[paramWallet].(map[interface{}]interface{})
 	if !ok {
 		return nil, fmt.Errorf("no wallet params provided")
 	}
 
-	walletInfo.Path, ok = walletParams["path"].(string)
+	walletInfo.Path, ok = walletParams[paramPath].(string)
 	if !ok {
 		return nil, fmt.Errorf("no path provided")
 	}
 
-	walletInfo.Password, ok = walletParams["password"].(string)
+	walletInfo.Password, ok = walletParams[paramPassword].(string)
 	if !ok {
 		return nil, fmt.Errorf("no password provided")
 	}
 
-	addressParam := walletParams["address"]
+	addressParam := walletParams[paramAddress]
 	if addressParam != nil {
 		if walletInfo.Address, ok = addressParam.(string); !ok {
 			return nil, fmt.Errorf("invalid address param")
@@ -196,7 +212,7 @@ func parseWallet(parameters map[string]interface{}) (*Wallet, error) {
 }
 
 func parsePeers(parameters map[string]interface{}) ([]*PeerInfo, error) {
-	poolParams, ok := parameters["peers"].(map[interface{}]interface{})
+	poolParams, ok := parameters[paramPeers].(map[interface{}]interface{})
 	if !ok {
 		return nil, fmt.Errorf("no peers params provided")
 	}
@@ -210,12 +226,12 @@ func parsePeers(parameters map[string]interface{}) ([]*PeerInfo, error) {
 
 		peer := new(PeerInfo)
 
-		peer.Address, ok = peerInfo["address"].(string)
+		peer.Address, ok = peerInfo[paramAddress].(string)
 		if !ok {
 			return nil, fmt.Errorf("invalid peer address")
 		}
 
-		weightParam := peerInfo["weight"]
+		weightParam := peerInfo[paramWeight]
 		if weightParam != nil {
 
 			switch weight := weightParam.(type) {
@@ -231,7 +247,7 @@ func parsePeers(parameters map[string]interface{}) ([]*PeerInfo, error) {
 			}
 		}
 
-		priorityParam := peerInfo["priority"]
+		priorityParam := peerInfo[paramPriority]
 		if priorityParam != nil {
 			if peer.Priority, ok = priorityParam.(int); !ok {
 				return nil, fmt.Errorf("invalid priority param")
@@ -400,42 +416,22 @@ func (d *driver) objectAddress(oid *oid.ID) *address.Address {
 }
 
 func (d *driver) rawObject(path string) *object.RawObject {
-	return d.formRawObject(map[string]string{
-		object.AttributeFileName:  filepath.Base(path),
-		attributeFilePath:         path,
-		object.AttributeTimestamp: strconv.FormatInt(time.Now().UTC().Unix(), 10),
-	})
-}
+	attrFilePath := object.NewAttribute()
+	attrFilePath.SetKey(attributeFilePath)
+	attrFilePath.SetValue(path)
 
-func (d *driver) rawPartObject(path string, number int) *object.RawObject {
-	return d.formRawObject(map[string]string{
-		attributeMultipartName:    path,
-		attributeMultipartNumber:  strconv.Itoa(number),
-		object.AttributeTimestamp: strconv.FormatInt(time.Now().UTC().Unix(), 10),
-	})
-}
+	attrFileName := object.NewAttribute()
+	attrFileName.SetKey(object.AttributeFileName)
+	attrFileName.SetValue(filepath.Base(path))
 
-func (d *driver) rawInitPartObject(path string) *object.RawObject {
-	return d.formRawObject(map[string]string{
-		attributeMultipartName:    multipartInitPartPrefix + path,
-		object.AttributeTimestamp: strconv.FormatInt(time.Now().UTC().Unix(), 10),
-	})
-}
-
-func (d *driver) formRawObject(headers map[string]string) *object.RawObject {
-	attributes := make([]*object.Attribute, 0, len(headers))
-
-	for key, val := range headers {
-		attr := object.NewAttribute()
-		attr.SetKey(key)
-		attr.SetValue(val)
-		attributes = append(attributes, attr)
-	}
+	attrTimestamp := object.NewAttribute()
+	attrTimestamp.SetKey(object.AttributeTimestamp)
+	attrTimestamp.SetValue(strconv.FormatInt(time.Now().UTC().Unix(), 10))
 
 	raw := object.NewRaw()
 	raw.SetOwnerID(d.sdkPool.OwnerID())
 	raw.SetContainerID(d.containerID)
-	raw.SetAttributes(attributes...)
+	raw.SetAttributes(attrFilePath, attrFileName, attrTimestamp)
 
 	return raw
 }
@@ -577,18 +573,30 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 		return newFileInfoDir(path), nil
 	}
 
-	id, err := d.searchOne(ctx, path)
+	ids, err := d.searchByPrefix(ctx, path)
 	if err != nil {
 		return nil, err
 	}
 
+	if len(ids) == 0 {
+		return nil, storagedriver.PathNotFoundError{Path: path, DriverName: driverName}
+	}
+
+	// assume there is not object with directory name
+	// e.g. if file '/a/b/c' exists, files '/a/b' and '/a' don't
+	if len(ids) > 1 {
+		return newFileInfoDir(path), nil
+	}
+
+	id := ids[0]
 	p := new(client.ObjectHeaderParams).WithAddress(d.objectAddress(id))
 	obj, err := d.sdkPool.GetObjectHeader(ctx, p)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't get object '%s': %w", id, err)
+		return nil, fmt.Errorf("couldn't get head object '%s': %w", id, err)
 	}
 
-	return newFileInfo(ctx, obj), nil
+	fileInfo := newFileInfo(ctx, obj, "")
+	return fileInfo, nil
 }
 
 func (d *driver) List(ctx context.Context, path string) ([]string, error) {
@@ -596,6 +604,8 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("couldn't search by prefix '%s': %w", path, err)
 	}
+
+	added := make(map[string]bool)
 
 	result := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -606,12 +616,14 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 			continue
 		}
 
-		fileInf := newFileInfo(ctx, obj)
-		if filepath.Dir(fileInf.Path()) == path {
+		fileInf := newFileInfo(ctx, obj, path)
+		if !added[fileInf.Path()] {
 			result = append(result, fileInf.Path())
+			added[fileInf.Path()] = true
 		}
 	}
 
+	sort.Strings(result)
 	return result, nil
 }
 
@@ -677,24 +689,7 @@ func (d *driver) URLFor(_ context.Context, _ string, _ map[string]interface{}) (
 }
 
 func (d *driver) Walk(ctx context.Context, path string, fn storagedriver.WalkFn) error {
-	ids, err := d.searchByPrefix(ctx, path)
-	if err != nil {
-		return fmt.Errorf("couldn't search by prefix for walk '%s': %w", path, err)
-	}
-
-	for _, id := range ids {
-		p := new(client.ObjectHeaderParams).WithAddress(d.objectAddress(id))
-		obj, err := d.sdkPool.GetObjectHeader(ctx, p)
-		if err != nil {
-			return fmt.Errorf("couldn't get object '%s': %w", id, err)
-		}
-		fileInf := newFileInfo(ctx, obj)
-		if err = fn(fileInf); err != nil {
-			return fmt.Errorf("walk fn error object '%s', id '%s': %w", fileInf.Path(), id, err)
-		}
-	}
-
-	return nil
+	return storagedriver.WalkFallback(ctx, d, path, fn)
 }
 
 func (d *driver) search(ctx context.Context, path string) ([]*oid.ID, error) {
@@ -715,15 +710,6 @@ func (d *driver) searchByPrefix(ctx context.Context, prefix string) ([]*oid.ID, 
 	return d.sdkPool.SearchObject(ctx, p)
 }
 
-func (d *driver) searchParts(ctx context.Context, path string) ([]*oid.ID, error) {
-	filters := object.NewSearchFilters()
-	filters.AddRootFilter()
-	filters.AddFilter(attributeMultipartName, path, object.MatchStringEqual)
-
-	p := new(client.SearchObjectParams).WithContainerID(d.containerID).WithSearchFilters(filters)
-	return d.sdkPool.SearchObject(ctx, p)
-}
-
 func (d *driver) searchSplitParts(ctx context.Context, splitID *object.SplitID) ([]*oid.ID, error) {
 	filters := object.NewSearchFilters()
 	filters.AddPhyFilter()
@@ -731,12 +717,6 @@ func (d *driver) searchSplitParts(ctx context.Context, splitID *object.SplitID) 
 
 	p := new(client.SearchObjectParams).WithContainerID(d.containerID).WithSearchFilters(filters)
 	return d.sdkPool.SearchObject(ctx, p)
-}
-
-func (d *driver) searchInitPart(ctx context.Context, path string) (*oid.ID, error) {
-	path = multipartInitPartPrefix + path
-	ids, err := d.searchParts(ctx, path)
-	return handleSearchResponse(path, ids, err)
 }
 
 func (d *driver) searchOne(ctx context.Context, path string) (*oid.ID, error) {
@@ -763,7 +743,7 @@ func handleSearchResponse(path string, ids []*oid.ID, err error) (*oid.ID, error
 	return ids[0], nil
 }
 
-func newFileInfo(ctx context.Context, obj *object.Object) storagedriver.FileInfo {
+func newFileInfo(ctx context.Context, obj *object.Object, prefix string) storagedriver.FileInfo {
 	fileInfoFields := storagedriver.FileInfoFields{
 		Size: int64(obj.PayloadSize()),
 	}
@@ -779,6 +759,17 @@ func newFileInfo(ctx context.Context, obj *object.Object) storagedriver.FileInfo
 				continue
 			}
 			fileInfoFields.ModTime = time.Unix(timestamp, 0)
+		}
+	}
+
+	if len(prefix) > 0 {
+		tail := strings.TrimPrefix(fileInfoFields.Path, prefix)
+		if len(tail) > 0 {
+			index := strings.Index(tail[1:], "/")
+			if index >= 0 {
+				fileInfoFields.IsDir = true
+				fileInfoFields.Path = prefix + tail[:index+1]
+			}
 		}
 	}
 

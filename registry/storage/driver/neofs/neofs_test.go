@@ -26,22 +26,24 @@ import (
 )
 
 const (
-	MB = 1024 * 1024
+	MB              = 1024 * 1024
+	ctxValueUUIDKey = "vars.uuid"
+	aioNodeEndpoint = "localhost:8080"
 )
 
 func params(walletPath string, containerID *cid.ID) map[string]interface{} {
 	return map[string]interface{}{
-		"wallet": map[interface{}]interface{}{
-			"path":     walletPath,
-			"password": "",
+		paramWallet: map[interface{}]interface{}{
+			paramPath:     walletPath,
+			paramPassword: "",
 		},
-		"peers": map[interface{}]interface{}{
+		paramPeers: map[interface{}]interface{}{
 			0: map[interface{}]interface{}{
-				"address": "localhost:8080",
+				paramAddress: aioNodeEndpoint,
 			},
 		},
-		"container":       containerID.String(),
-		"max_object_size": 1 * MB,
+		paramContainer:     containerID.String(),
+		paramMaxObjectSize: 1 * MB,
 	}
 }
 
@@ -72,7 +74,7 @@ func TestIntegration(t *testing.T) {
 
 	rootCtx := context.Background()
 	aioImage := "nspccdev/neofs-aio-testcontainer:"
-	versions := []string{"0.27.5" /*, "latest"*/}
+	versions := []string{"0.27.5", "latest"}
 
 	for _, version := range versions {
 		ctx, cancel := context.WithCancel(rootCtx)
@@ -84,8 +86,8 @@ func TestIntegration(t *testing.T) {
 		drvr, err := FromParameters(params(f.Name(), CID))
 		require.NoError(t, err)
 
-		//t.Run("simple write "+version, func(t *testing.T) { simpleWrite(ctx, t, drvr, version) })
-		//t.Run("resume write "+version, func(t *testing.T) { resumeWrite(ctx, t, drvr, version) })
+		t.Run("simple write "+version, func(t *testing.T) { simpleWrite(ctx, t, drvr, version) })
+		t.Run("resume write "+version, func(t *testing.T) { resumeWrite(ctx, t, drvr, version) })
 		t.Run("write read "+version, func(t *testing.T) { writeRead(ctx, t, drvr, version) })
 
 		err = aioContainer.Terminate(ctx)
@@ -94,18 +96,21 @@ func TestIntegration(t *testing.T) {
 	}
 }
 
-func simpleWrite(ctx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+func formCtxAndPath(ctx context.Context, version string) (context.Context, string) {
 	uid := uuid.NewString()
-	ctx = context.WithValue(ctx, "vars.uuid", uid)
+	ctx = context.WithValue(ctx, ctxValueUUIDKey, uid)
 	path := "/test/file/" + version + "/" + uid
 
+	return ctx, path
+}
+
+func simpleWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+	ctx, path := formCtxAndPath(rootCtx, version)
 	writeAndCheck(ctx, t, drvr, path, false)
 }
 
-func resumeWrite(ctx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
-	uid := uuid.NewString()
-	ctx = context.WithValue(ctx, "vars.uuid", uid)
-	path := "/test/file/" + version + "/" + uid
+func resumeWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+	ctx, path := formCtxAndPath(rootCtx, version)
 
 	fileWriter, err := drvr.Writer(ctx, path, false)
 	require.NoError(t, err)
@@ -116,10 +121,8 @@ func resumeWrite(ctx context.Context, t *testing.T, drvr storagedriver.StorageDr
 	writeAndCheck(ctx, t, drvr, path, true)
 }
 
-func writeRead(ctx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
-	uid := uuid.NewString()
-	ctx = context.WithValue(ctx, "vars.uuid", uid)
-	path := "/test/file/" + version + "/" + uid
+func writeRead(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+	ctx, path := formCtxAndPath(rootCtx, version)
 
 	fileWriter, err := drvr.Writer(ctx, path, false)
 	require.NoError(t, err)
@@ -194,7 +197,7 @@ func createDockerContainer(ctx context.Context, t *testing.T, image string) test
 
 func getPool(ctx context.Context, t *testing.T, key *keys.PrivateKey) pool.Pool {
 	pb := new(pool.Builder)
-	pb.AddNode("localhost:8080", 1, 1)
+	pb.AddNode(aioNodeEndpoint, 1, 1)
 
 	opts := &pool.BuilderOptions{
 		Key:                   &key.PrivateKey,
