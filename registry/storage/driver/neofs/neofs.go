@@ -3,6 +3,7 @@ package neofs
 import (
 	"context"
 	"crypto/ecdsa"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/nspcc-dev/neo-go/pkg/wallet"
 	"github.com/nspcc-dev/neofs-sdk-go/client"
 	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
+	"github.com/nspcc-dev/neofs-sdk-go/netmap"
 	"github.com/nspcc-dev/neofs-sdk-go/object"
 	"github.com/nspcc-dev/neofs-sdk-go/object/address"
 	"github.com/nspcc-dev/neofs-sdk-go/object/id"
@@ -34,7 +36,7 @@ const (
 	attributeFilePath = "FilePath"
 	attributeSHAState = "sha256state"
 
-	defaultMaxObjectSize = 3145728 // 3 mb
+	maxObjectSizeParameter = "MaxObjectSize"
 )
 
 const (
@@ -51,7 +53,6 @@ const (
 	paramRebalanceInterval         = "rebalance_interval"
 	paramSessionExpirationDuration = "session_expiration_duration"
 	paramRpcEndpoint               = "rpc_endpoint"
-	paramMaxObjectSize             = "max_object_size"
 )
 
 //DriverParameters is a struct that encapsulates all of the driver parameters after all values have been set.
@@ -64,7 +65,6 @@ type DriverParameters struct {
 	RebalanceInterval         time.Duration
 	SessionExpirationDuration uint64
 	RpcEndpoint               string
-	MaxObjectSize             uint64
 }
 
 // Wallet contains params to get key from wallet.
@@ -118,7 +118,6 @@ type Driver struct {
 // - rebalance_interval
 // - session_expiration_duration
 // - rpc_endpoint
-// - max_object_size
 func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
 	peers, err := parsePeers(parameters)
 	if err != nil {
@@ -163,11 +162,6 @@ func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDri
 		return nil, err
 	}
 
-	maxSize, err := parseUInt64(parameters, paramMaxObjectSize, defaultMaxObjectSize)
-	if err != nil {
-		return nil, err
-	}
-
 	params := DriverParameters{
 		Peers:                     peers,
 		ContainerID:               containerID,
@@ -177,7 +171,6 @@ func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDri
 		RebalanceInterval:         rebalanceInterval,
 		SessionExpirationDuration: expiration,
 		RpcEndpoint:               rpcEndpoint,
-		MaxObjectSize:             maxSize,
 	}
 
 	return New(params)
@@ -314,6 +307,11 @@ func New(params DriverParameters) (*Driver, error) {
 		return nil, fmt.Errorf("couldn't create sdk pool: %w", err)
 	}
 
+	maxObjectSize, err := getMaxObjectSize(ctx, sdkPool)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't get max object size: %w", err)
+	}
+
 	cnrID, err := getContainerID(ctx, params)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get container id: %w", err)
@@ -323,7 +321,7 @@ func New(params DriverParameters) (*Driver, error) {
 		sdkPool:     sdkPool,
 		key:         &acc.PrivateKey().PrivateKey,
 		containerID: cnrID,
-		maxSize:     params.MaxObjectSize,
+		maxSize:     maxObjectSize,
 	}
 
 	return &Driver{
@@ -333,6 +331,35 @@ func New(params DriverParameters) (*Driver, error) {
 			},
 		},
 	}, nil
+}
+
+func getMaxObjectSize(ctx context.Context, sdkPool pool.Pool) (uint64, error) {
+	cl, _, err := sdkPool.Connection()
+	if err != nil {
+		return 0, fmt.Errorf("couldn't get connection: %w", err)
+	}
+
+	res, err := cl.NetworkInfo(ctx, client.NetworkInfoPrm{})
+	if err != nil {
+		return 0, fmt.Errorf("couldn't get network info: %w", err)
+	}
+
+	var maxObjectSize uint64
+	res.Info().NetworkConfig().IterateParameters(func(param *netmap.NetworkParameter) bool {
+		if string(param.Key()) == maxObjectSizeParameter {
+			buffer := make([]byte, 8)
+			copy(buffer, param.Value())
+			maxObjectSize = binary.LittleEndian.Uint64(buffer)
+			return true
+		}
+		return false
+	})
+
+	if maxObjectSize == 0 {
+		return 0, fmt.Errorf("max object size must not be zero")
+	}
+
+	return maxObjectSize, nil
 }
 
 func getContainerID(ctx context.Context, params DriverParameters) (*cid.ID, error) {
