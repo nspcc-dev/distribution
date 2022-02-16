@@ -42,8 +42,7 @@ storage:
       # container can be nicename (rpc_endpoint is required)
       container: A8cfsuT1cBi46Carks9kqbVULwoQiJfif2JVozf3nb4j
       # the following params are optional
-      max_object_size: 3145728 # 3mb
-      session_expiration_duration: 1000 # in blocks
+      session_expiration_duration: 1000 # in epoch
       connection_timeout: 5s
       request_timeout: 5s
       rebalance_interval: 30s

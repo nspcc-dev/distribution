@@ -26,7 +26,6 @@ import (
 )
 
 const (
-	MB              = 1024 * 1024
 	ctxValueUUIDKey = "vars.uuid"
 	aioNodeEndpoint = "localhost:8080"
 )
@@ -42,8 +41,7 @@ func params(walletPath string, containerID *cid.ID) map[string]interface{} {
 				paramAddress: aioNodeEndpoint,
 			},
 		},
-		paramContainer:     containerID.String(),
-		paramMaxObjectSize: 1 * MB,
+		paramContainer: containerID.String(),
 	}
 }
 
@@ -86,9 +84,12 @@ func TestIntegration(t *testing.T) {
 		drvr, err := FromParameters(params(f.Name(), CID))
 		require.NoError(t, err)
 
-		t.Run("simple write "+version, func(t *testing.T) { simpleWrite(ctx, t, drvr, version) })
-		t.Run("resume write "+version, func(t *testing.T) { resumeWrite(ctx, t, drvr, version) })
-		t.Run("write read "+version, func(t *testing.T) { writeRead(ctx, t, drvr, version) })
+		drvrImpl := drvr.(*Driver).StorageDriver.(*driver)
+		maxObjectSize := drvrImpl.maxSize
+
+		t.Run("simple write "+version, func(t *testing.T) { simpleWrite(ctx, t, drvr, maxObjectSize, version) })
+		t.Run("resume write "+version, func(t *testing.T) { resumeWrite(ctx, t, drvr, maxObjectSize, version) })
+		t.Run("write read "+version, func(t *testing.T) { writeRead(ctx, t, drvr, maxObjectSize, version) })
 
 		err = aioContainer.Terminate(ctx)
 		require.NoError(t, err)
@@ -104,12 +105,12 @@ func formCtxAndPath(ctx context.Context, version string) (context.Context, strin
 	return ctx, path
 }
 
-func simpleWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+func simpleWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, version string) {
 	ctx, path := formCtxAndPath(rootCtx, version)
-	writeAndCheck(ctx, t, drvr, path, false)
+	writeAndCheck(ctx, t, drvr, maxObjectSize, path, false)
 }
 
-func resumeWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+func resumeWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, version string) {
 	ctx, path := formCtxAndPath(rootCtx, version)
 
 	fileWriter, err := drvr.Writer(ctx, path, false)
@@ -118,16 +119,17 @@ func resumeWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.Stora
 	err = fileWriter.Close()
 	require.NoError(t, err)
 
-	writeAndCheck(ctx, t, drvr, path, true)
+	writeAndCheck(ctx, t, drvr, maxObjectSize, path, true)
 }
 
-func writeRead(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+func writeRead(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, version string) {
 	ctx, path := formCtxAndPath(rootCtx, version)
 
 	fileWriter, err := drvr.Writer(ctx, path, false)
 	require.NoError(t, err)
 
-	data := make([]byte, 3*MB+1024)
+	dataSize := maxObjectSize + 1024
+	data := make([]byte, dataSize)
 	_, err = rand.Read(data)
 	require.NoError(t, err)
 
@@ -140,7 +142,7 @@ func writeRead(rootCtx context.Context, t *testing.T, drvr storagedriver.Storage
 	fileReader, err := drvr.Reader(ctx, path, 0)
 	require.NoError(t, err)
 
-	buffer := make([]byte, 2*MB)
+	buffer := make([]byte, dataSize/2)
 	_, err = io.ReadFull(fileReader, buffer)
 	require.NoError(t, err)
 	require.Equal(t, data[:len(buffer)], buffer)
@@ -159,11 +161,12 @@ func writeRead(rootCtx context.Context, t *testing.T, drvr storagedriver.Storage
 	require.NoError(t, err)
 }
 
-func writeAndCheck(ctx context.Context, t *testing.T, drvr storagedriver.StorageDriver, path string, append bool) {
+func writeAndCheck(ctx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, path string, append bool) {
 	fileWriter, err := drvr.Writer(ctx, path, append)
 	require.NoError(t, err)
 
-	data := make([]byte, 3*MB+1024)
+	dataSize := maxObjectSize + 1024
+	data := make([]byte, dataSize)
 	_, err = rand.Read(data)
 	require.NoError(t, err)
 
