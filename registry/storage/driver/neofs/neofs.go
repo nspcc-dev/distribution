@@ -53,6 +53,11 @@ const (
 	paramRebalanceInterval         = "rebalance_interval"
 	paramSessionExpirationDuration = "session_expiration_duration"
 	paramRpcEndpoint               = "rpc_endpoint"
+
+	defaultConnectionTimeout         = 4 * time.Second
+	defaultRequestTimeout            = 4 * time.Second
+	defaultRebalanceInterval         = 20 * time.Second
+	defaultSessionExpirationDuration = 100 // in epoch
 )
 
 //DriverParameters is a struct that encapsulates all of the driver parameters after all values have been set.
@@ -142,22 +147,22 @@ func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDri
 		}
 	}
 
-	connectionTimeout, err := parseTimeout(parameters, paramConnectionTimeout, 4*time.Second)
+	connectionTimeout, err := parseTimeout(parameters, paramConnectionTimeout, defaultConnectionTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	requestTimeout, err := parseTimeout(parameters, paramRequestTimeout, 4*time.Second)
+	requestTimeout, err := parseTimeout(parameters, paramRequestTimeout, defaultRequestTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	rebalanceInterval, err := parseTimeout(parameters, paramRebalanceInterval, 20*time.Second)
+	rebalanceInterval, err := parseTimeout(parameters, paramRebalanceInterval, defaultRebalanceInterval)
 	if err != nil {
 		return nil, err
 	}
 
-	expiration, err := parseUInt64(parameters, paramSessionExpirationDuration, 0)
+	expiration, err := parseUInt64(parameters, paramSessionExpirationDuration, defaultSessionExpirationDuration)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +231,6 @@ func parsePeers(parameters map[string]interface{}) ([]*PeerInfo, error) {
 
 		weightParam := peerInfo[paramWeight]
 		if weightParam != nil {
-
 			switch weight := weightParam.(type) {
 			case int:
 				peer.Weight = float64(weight)
