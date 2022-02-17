@@ -103,7 +103,7 @@ func getParentHashers(parent *object.RawObject, lastPart *object.Object) ([]*pay
 		return hashers, nil
 	}
 
-	hashState, err := getLastSHAState(lastPart)
+	hashState, err := getSHAState(lastPart)
 	if err != nil {
 		return nil, err
 	}
@@ -115,13 +115,13 @@ func getParentHashers(parent *object.RawObject, lastPart *object.Object) ([]*pay
 	return hashers, nil
 }
 
-func getLastSHAState(lastPart *object.Object) ([]byte, error) {
+func getSHAState(obj *object.Object) ([]byte, error) {
 	var (
 		err       error
 		hashState []byte
 	)
 
-	for _, attr := range lastPart.Attributes() {
+	for _, attr := range obj.Attributes() {
 		if attr.Key() == attributeSHAState {
 			if hashState, err = hex.DecodeString(attr.Value()); err != nil {
 				return nil, fmt.Errorf("couldn't decode sha state '%s': %w", attr.Value(), err)
@@ -130,7 +130,7 @@ func getLastSHAState(lastPart *object.Object) ([]byte, error) {
 		}
 	}
 	if hashState == nil {
-		return nil, fmt.Errorf("last part has not sha state")
+		return nil, fmt.Errorf("object '%s' has not sha state", obj.ID())
 	}
 
 	return hashState, nil
