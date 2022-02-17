@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/binary"
 	"fmt"
+	"github.com/nspcc-dev/neofs-sdk-go/version"
 	"io"
 	"path/filepath"
 	"sort"
@@ -844,19 +845,34 @@ func (t *objTarget) Write(p []byte) (n int, err error) {
 }
 
 func (t *objTarget) Close() (*transformer.AccessIdentifiers, error) {
-	var (
-		parID  *oid.ID
-		parHdr *object.Object
-	)
+	conn, _, err := t.sdkPool.Connection()
+	if err != nil {
+		return nil, fmt.Errorf("couldn't get connection: %w", err)
+	}
+
+	netInfoRes, err := conn.NetworkInfo(t.ctx, client.NetworkInfoPrm{})
+	if err != nil {
+		return nil, fmt.Errorf("couldn't get netrwork info: %w", err)
+	}
 
 	sz := 0
 	for i := range t.chunks {
 		sz += len(t.chunks[i])
 	}
+
 	t.obj.SetPayloadSize(uint64(sz))
+	t.obj.SetVersion(version.Current())
+	t.obj.SetCreationEpoch(netInfoRes.Info().CurrentEpoch())
+
+	var (
+		parID  *oid.ID
+		parHdr *object.Object
+	)
 
 	if par := t.obj.Parent(); par != nil && par.Signature() == nil {
 		rawPar := object.NewRawFromV2(par.ToV2())
+
+		rawPar.SetCreationEpoch(netInfoRes.Info().CurrentEpoch())
 
 		if err := object.SetIDWithSignature(t.key, rawPar); err != nil {
 			return nil, fmt.Errorf("could not finalize parent object: %w", err)
@@ -879,7 +895,7 @@ func (t *objTarget) Close() (*transformer.AccessIdentifiers, error) {
 	t.obj.SetPayload(payload)
 
 	p := new(client.PutObjectParams).WithObject(t.obj.Object())
-	_, err := t.sdkPool.PutObject(t.ctx, p)
+	_, err = t.sdkPool.PutObject(t.ctx, p)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't put part: %w", err)
 	}
