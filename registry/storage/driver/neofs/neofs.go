@@ -589,7 +589,7 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 		splitInfo.SetLastPart(lastPartID)
 	}
 
-	wrtr, err := NewSizeLimiterWriter(ctx, d, path, splitInfo, parts)
+	wrtr, err := newSizeLimiterWriter(ctx, d, path, splitInfo, parts)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't init size limiter writer: %w", err)
 	}
