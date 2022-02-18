@@ -47,7 +47,7 @@ type writer struct {
 
 const tzChecksumSize = 64
 
-// NewSizeLimiterWriter creates new FileWriter that split written payload to NeoFS objects with specific max size.
+// NewSizeLimiterWriter creates new FileWriter that splits written payload to NeoFS objects with specific max size.
 // MaxSize is taken from driver parameter.
 func NewSizeLimiterWriter(ctx context.Context, d *driver, path string, splitInfo *object.SplitInfo, parts []*object.Object) (storagedriver.FileWriter, error) {
 	var (
