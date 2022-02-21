@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"github.com/nspcc-dev/neofs-sdk-go/version"
 	"io"
@@ -344,7 +345,7 @@ func getMaxObjectSize(ctx context.Context, sdkPool pool.Pool) (uint64, error) {
 		return 0, fmt.Errorf("couldn't get connection: %w", err)
 	}
 
-	res, err := cl.NetworkInfo(ctx, client.NetworkInfoPrm{})
+	res, err := cl.NetworkInfo(ctx, client.PrmNetworkInfo{})
 	if err != nil {
 		return 0, fmt.Errorf("couldn't get network info: %w", err)
 	}
@@ -478,13 +479,12 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 
-	p := new(client.GetObjectParams).WithAddress(d.objectAddress(id))
-	obj, err := d.sdkPool.GetObject(ctx, p)
+	obj, err := d.sdkPool.GetObject(ctx, *d.objectAddress(id))
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get object '%s': %w", id, err)
 	}
 
-	return obj.Payload(), nil
+	return io.ReadAll(obj.Payload)
 }
 
 func (d *driver) PutContent(ctx context.Context, path string, content []byte) error {
@@ -495,8 +495,7 @@ func (d *driver) PutContent(ctx context.Context, path string, content []byte) er
 	rawObject := d.rawObject(path)
 	rawObject.SetPayload(content)
 
-	p := new(client.PutObjectParams).WithObject(rawObject.Object())
-	if _, err := d.sdkPool.PutObject(ctx, p); err != nil {
+	if _, err := d.sdkPool.PutObject(ctx, *rawObject.Object(), nil); err != nil {
 		return fmt.Errorf("couldn't put object '%s': %w", path, err)
 	}
 
@@ -511,26 +510,20 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 
 	addr := d.objectAddress(id)
 
-	p := new(client.ObjectHeaderParams).WithAddress(addr)
-	obj, err := d.sdkPool.GetObjectHeader(ctx, p)
+	obj, err := d.sdkPool.HeadObject(ctx, *addr)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't head object '%s', id '%s': %w", path, id, err)
 	}
 
-	rng := object.NewRange()
-	rng.SetOffset(uint64(offset))
-	rng.SetLength(uint64(int64(obj.PayloadSize()) - offset))
+	length := uint64(int64(obj.PayloadSize()) - offset)
 
-	pr, pw := io.Pipe()
-	go func() {
-		dp := new(client.RangeDataParams).WithAddress(addr).WithRange(rng).WithDataWriter(pw)
-		if _, err = d.sdkPool.ObjectPayloadRangeData(ctx, dp); err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("couldn't get payload range of object '%s', id '%s': %w", path, id, err))
-		}
-		_ = pw.Close()
-	}()
+	res, err := d.sdkPool.ObjectRange(ctx, *addr, uint64(offset), length)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't get payload range of object '%s', offset %d, length %d, id '%s': %w",
+			path, offset, length, id, err)
+	}
 
-	return pr, nil
+	return res, nil
 }
 
 func getUploadUUID(ctx context.Context) (uuid string) {
@@ -560,8 +553,7 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 
 	parts := make([]*object.Object, len(ids))
 	for i, id := range ids {
-		p := new(client.ObjectHeaderParams).WithAddress(d.objectAddress(id))
-		obj, err := d.sdkPool.GetObjectHeader(ctx, p)
+		obj, err := d.sdkPool.HeadObject(ctx, *d.objectAddress(&id))
 		if err != nil {
 			return nil, fmt.Errorf("couldn't head object part '%s', id '%s', splitID '%s': %w", path, id, splitID, err)
 		}
@@ -621,8 +613,7 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 	}
 
 	id := ids[0]
-	p := new(client.ObjectHeaderParams).WithAddress(d.objectAddress(id))
-	obj, err := d.sdkPool.GetObjectHeader(ctx, p)
+	obj, err := d.sdkPool.HeadObject(ctx, *d.objectAddress(&id))
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get head object '%s': %w", id, err)
 	}
@@ -641,8 +632,7 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 
 	result := make([]string, 0, len(ids))
 	for _, id := range ids {
-		p := new(client.ObjectHeaderParams).WithAddress(d.objectAddress(id))
-		obj, err := d.sdkPool.GetObjectHeader(ctx, p)
+		obj, err := d.sdkPool.HeadObject(ctx, *d.objectAddress(&id))
 		if err != nil {
 			dcontext.GetLogger(ctx).Warnf("couldn't get list object '%s' in path '%s': %s", id, path, err)
 			continue
@@ -660,8 +650,6 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 }
 
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
-	pr, pw := io.Pipe()
-
 	sourceID, err := d.searchOne(ctx, sourcePath)
 	if err != nil {
 		return err
@@ -671,22 +659,23 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 		return fmt.Errorf("couldn't delete '%s' object:  %w", destPath, err)
 	}
 
-	go func() {
-		p := new(client.GetObjectParams).WithAddress(d.objectAddress(sourceID)).WithPayloadWriter(pw)
-		_, err = d.sdkPool.GetObject(ctx, p)
-		if err = pw.CloseWithError(err); err != nil {
-			dcontext.GetLogger(ctx).Errorf("could not get source object '%s' by oid '%s': %w", sourcePath, sourceID, err)
+	obj, err := d.sdkPool.GetObject(ctx, *d.objectAddress(sourceID))
+	if err != nil {
+		return fmt.Errorf("could not get source object '%s' by oid '%s': %w", sourcePath, sourceID, err)
+	}
+	defer func() {
+		if err = obj.Payload.Close(); err != nil {
+			dcontext.GetLogger(ctx).Errorf("couldn't close object payload reader, path '%s' by oid '%s': %s",
+				sourcePath, sourceID, err.Error())
 		}
 	}()
 
 	rawObj := d.rawObject(destPath)
-	p := new(client.PutObjectParams).WithObject(rawObj.Object()).WithPayloadReader(pr)
-	if _, err = d.sdkPool.PutObject(ctx, p); err != nil {
+	if _, err = d.sdkPool.PutObject(ctx, *rawObj.Object(), obj.Payload); err != nil {
 		return fmt.Errorf("couldn't put object '%s': %w", destPath, err)
 	}
 
-	dp := new(client.DeleteObjectParams).WithAddress(d.objectAddress(sourceID))
-	if err = d.sdkPool.DeleteObject(ctx, dp); err != nil {
+	if err = d.sdkPool.DeleteObject(ctx, *d.objectAddress(sourceID)); err != nil {
 		return fmt.Errorf("couldn't remove source file '%s', id '%s': %w", sourcePath, sourceID, err)
 	}
 
@@ -700,7 +689,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 	}
 
 	for _, id := range ids {
-		if err = d.delete(ctx, id); err != nil {
+		if err = d.delete(ctx, &id); err != nil {
 			return fmt.Errorf("couldn't delete object by path '%s': %w", path, err)
 		}
 	}
@@ -708,8 +697,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 }
 
 func (d *driver) delete(ctx context.Context, id *oid.ID) error {
-	p := new(client.DeleteObjectParams).WithAddress(d.objectAddress(id))
-	if err := d.sdkPool.DeleteObject(ctx, p); err != nil {
+	if err := d.sdkPool.DeleteObject(ctx, *d.objectAddress(id)); err != nil {
 		return fmt.Errorf("couldn't delete object '%s': %w", id, err)
 	}
 
@@ -724,31 +712,59 @@ func (d *driver) Walk(ctx context.Context, path string, fn storagedriver.WalkFn)
 	return storagedriver.WalkFallback(ctx, d, path, fn)
 }
 
-func (d *driver) search(ctx context.Context, path string) ([]*oid.ID, error) {
+func (d *driver) search(ctx context.Context, path string) ([]oid.ID, error) {
 	filters := object.NewSearchFilters()
 	filters.AddRootFilter()
 	filters.AddFilter(attributeFilePath, path, object.MatchStringEqual)
 
-	p := new(client.SearchObjectParams).WithContainerID(d.containerID).WithSearchFilters(filters)
-	return d.sdkPool.SearchObject(ctx, p)
+	return d.baseSearch(ctx, filters)
 }
 
-func (d *driver) searchByPrefix(ctx context.Context, prefix string) ([]*oid.ID, error) {
+func (d *driver) searchByPrefix(ctx context.Context, prefix string) ([]oid.ID, error) {
 	filters := object.NewSearchFilters()
 	filters.AddRootFilter()
 	filters.AddFilter(attributeFilePath, prefix, object.MatchCommonPrefix)
 
-	p := new(client.SearchObjectParams).WithContainerID(d.containerID).WithSearchFilters(filters)
-	return d.sdkPool.SearchObject(ctx, p)
+	return d.baseSearch(ctx, filters)
 }
 
-func (d *driver) searchSplitParts(ctx context.Context, splitID *object.SplitID) ([]*oid.ID, error) {
+func (d *driver) searchSplitParts(ctx context.Context, splitID *object.SplitID) ([]oid.ID, error) {
 	filters := object.NewSearchFilters()
 	filters.AddPhyFilter()
 	filters.AddSplitIDFilter(object.MatchStringEqual, splitID)
 
-	p := new(client.SearchObjectParams).WithContainerID(d.containerID).WithSearchFilters(filters)
-	return d.sdkPool.SearchObject(ctx, p)
+	return d.baseSearch(ctx, filters)
+}
+
+func (d *driver) baseSearch(ctx context.Context, filters object.SearchFilters) ([]oid.ID, error) {
+	res, err := d.sdkPool.SearchObjects(ctx, *d.containerID, filters)
+	if err != nil {
+		return nil, fmt.Errorf("init searching using client: %w", err)
+	}
+
+	defer res.Close()
+
+	var num, read int
+	buf := make([]oid.ID, 10)
+
+	for {
+		num, err = res.Read(buf[read:])
+		if num > 0 {
+			read += num
+			buf = append(buf, oid.ID{})
+			buf = buf[:cap(buf)]
+		}
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+
+			return nil, fmt.Errorf("couldn't read found objects: %w", err)
+		}
+	}
+
+	return buf[:read], nil
 }
 
 func (d *driver) searchOne(ctx context.Context, path string) (*oid.ID, error) {
@@ -756,7 +772,7 @@ func (d *driver) searchOne(ctx context.Context, path string) (*oid.ID, error) {
 	return handleSearchResponse(path, ids, err)
 }
 
-func handleSearchResponse(path string, ids []*oid.ID, err error) (*oid.ID, error) {
+func handleSearchResponse(path string, ids []oid.ID, err error) (*oid.ID, error) {
 	if err != nil {
 		return nil, fmt.Errorf("couldn't search path '%s': %w", path, err)
 	}
@@ -772,7 +788,7 @@ func handleSearchResponse(path string, ids []*oid.ID, err error) (*oid.ID, error
 		return nil, fmt.Errorf("found %d objects by path '%s'", len(ids), path)
 	}
 
-	return ids[0], nil
+	return &ids[0], nil
 }
 
 func newFileInfo(ctx context.Context, obj *object.Object, prefix string) storagedriver.FileInfo {
@@ -850,7 +866,7 @@ func (t *objTarget) Close() (*transformer.AccessIdentifiers, error) {
 		return nil, fmt.Errorf("couldn't get connection: %w", err)
 	}
 
-	netInfoRes, err := conn.NetworkInfo(t.ctx, client.NetworkInfoPrm{})
+	netInfoRes, err := conn.NetworkInfo(t.ctx, client.PrmNetworkInfo{})
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get netrwork info: %w", err)
 	}
@@ -894,8 +910,7 @@ func (t *objTarget) Close() (*transformer.AccessIdentifiers, error) {
 	}
 	t.obj.SetPayload(payload)
 
-	p := new(client.PutObjectParams).WithObject(t.obj.Object())
-	_, err = t.sdkPool.PutObject(t.ctx, p)
+	_, err = t.sdkPool.PutObject(t.ctx, *t.obj.Object(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't put part: %w", err)
 	}
