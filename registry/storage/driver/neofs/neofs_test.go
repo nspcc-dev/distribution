@@ -87,9 +87,11 @@ func TestIntegration(t *testing.T) {
 		drvrImpl := drvr.(*Driver).StorageDriver.(*driver)
 		maxObjectSize := drvrImpl.maxSize
 
-		t.Run("simple write "+version, func(t *testing.T) { simpleWrite(ctx, t, drvr, maxObjectSize, version) })
-		t.Run("resume write "+version, func(t *testing.T) { resumeWrite(ctx, t, drvr, maxObjectSize, version) })
-		t.Run("write read "+version, func(t *testing.T) { writeRead(ctx, t, drvr, maxObjectSize, version) })
+		t.Run("move "+version, func(t *testing.T) { testMove(ctx, t, drvr, version) })
+		t.Run("set get content "+version, func(t *testing.T) { testSetContent(ctx, t, drvr, version) })
+		t.Run("simple write "+version, func(t *testing.T) { testSimpleWrite(ctx, t, drvr, maxObjectSize, version) })
+		t.Run("resume write "+version, func(t *testing.T) { testResumeWrite(ctx, t, drvr, maxObjectSize, version) })
+		t.Run("write read "+version, func(t *testing.T) { testWriteRead(ctx, t, drvr, maxObjectSize, version) })
 
 		err = aioContainer.Terminate(ctx)
 		require.NoError(t, err)
@@ -105,12 +107,54 @@ func formCtxAndPath(ctx context.Context, version string) (context.Context, strin
 	return ctx, path
 }
 
-func simpleWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, version string) {
+func testSetContent(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+	ctx, path := formCtxAndPath(rootCtx, version)
+
+	content := []byte("test content")
+
+	err := drvr.PutContent(ctx, path, content)
+	require.NoError(t, err)
+
+	data, err := drvr.GetContent(ctx, path)
+	require.NoError(t, err)
+
+	require.Equal(t, content, data)
+
+	err = drvr.Delete(ctx, path)
+	require.NoError(t, err)
+
+	_, err = drvr.GetContent(ctx, path)
+	require.Error(t, err)
+}
+
+func testMove(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+	ctx, path := formCtxAndPath(rootCtx, version)
+
+	content := []byte("test content")
+
+	err := drvr.PutContent(ctx, path, content)
+	require.NoError(t, err)
+
+	newPath := path + "/dest"
+
+	err = drvr.Move(ctx, path, newPath)
+	require.NoError(t, err)
+
+	_, err = drvr.GetContent(ctx, path)
+	require.Error(t, err)
+
+	data, err := drvr.GetContent(ctx, newPath)
+	require.NoError(t, err)
+
+	require.Equal(t, content, data)
+}
+
+func testSimpleWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, version string) {
 	ctx, path := formCtxAndPath(rootCtx, version)
 	writeAndCheck(ctx, t, drvr, maxObjectSize, path, false)
 }
 
-func resumeWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, version string) {
+func testResumeWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, version string) {
 	ctx, path := formCtxAndPath(rootCtx, version)
 
 	fileWriter, err := drvr.Writer(ctx, path, false)
@@ -122,7 +166,7 @@ func resumeWrite(rootCtx context.Context, t *testing.T, drvr storagedriver.Stora
 	writeAndCheck(ctx, t, drvr, maxObjectSize, path, true)
 }
 
-func writeRead(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, version string) {
+func testWriteRead(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, version string) {
 	ctx, path := formCtxAndPath(rootCtx, version)
 
 	fileWriter, err := drvr.Writer(ctx, path, false)
