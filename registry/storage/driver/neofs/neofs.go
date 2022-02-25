@@ -515,7 +515,11 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 		return nil, fmt.Errorf("couldn't head object '%s', id '%s': %w", path, id, err)
 	}
 
-	length := uint64(int64(obj.PayloadSize()) - offset)
+	if uint64(offset) >= obj.PayloadSize() {
+		return nil, fmt.Errorf("invalid offset %d for object length %d", offset, obj.PayloadSize())
+	}
+
+	length := obj.PayloadSize() - uint64(offset)
 
 	res, err := d.sdkPool.ObjectRange(ctx, *addr, uint64(offset), length)
 	if err != nil {
