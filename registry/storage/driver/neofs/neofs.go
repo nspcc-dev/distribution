@@ -21,7 +21,7 @@ import (
 	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
 	resolver "github.com/nspcc-dev/neofs-sdk-go/ns"
 	"github.com/nspcc-dev/neofs-sdk-go/object"
-	"github.com/nspcc-dev/neofs-sdk-go/object/id"
+	oid "github.com/nspcc-dev/neofs-sdk-go/object/id"
 	"github.com/nspcc-dev/neofs-sdk-go/pool"
 	"github.com/nspcc-dev/neofs-sdk-go/user"
 	"github.com/nspcc-dev/neofs-sdk-go/version"
@@ -47,7 +47,7 @@ const (
 	paramRequestTimeout            = "request_timeout"
 	paramRebalanceInterval         = "rebalance_interval"
 	paramSessionExpirationDuration = "session_expiration_duration"
-	paramRpcEndpoint               = "rpc_endpoint"
+	paramRPCEndpoint               = "rpc_endpoint"
 
 	defaultConnectionTimeout         = 4 * time.Second
 	defaultRequestTimeout            = 4 * time.Second
@@ -64,7 +64,7 @@ type DriverParameters struct {
 	RequestTimeout            time.Duration
 	RebalanceInterval         time.Duration
 	SessionExpirationDuration uint64
-	RpcEndpoint               string
+	RPCEndpoint               string
 }
 
 // Wallet contains params to get key from wallet.
@@ -136,7 +136,7 @@ func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDri
 	}
 
 	var rpcEndpoint string
-	rpcEndpointParam := parameters[paramRpcEndpoint]
+	rpcEndpointParam := parameters[paramRPCEndpoint]
 	if rpcEndpointParam != nil {
 		if rpcEndpoint, ok = rpcEndpointParam.(string); !ok {
 			return nil, fmt.Errorf("invalid rpc_endpoint param")
@@ -171,7 +171,7 @@ func FromParameters(parameters map[string]interface{}) (storagedriver.StorageDri
 		RequestTimeout:            requestTimeout,
 		RebalanceInterval:         rebalanceInterval,
 		SessionExpirationDuration: expiration,
-		RpcEndpoint:               rpcEndpoint,
+		RPCEndpoint:               rpcEndpoint,
 	}
 
 	return New(params)
@@ -395,12 +395,12 @@ func createPool(ctx context.Context, acc *wallet.Account, param DriverParameters
 }
 
 func createNnsResolver(params DriverParameters) (*resolver.NNS, error) {
-	if params.RpcEndpoint == "" {
+	if params.RPCEndpoint == "" {
 		return nil, fmt.Errorf("empty rpc endpoind")
 	}
 
 	var nns resolver.NNS
-	if err := nns.Dial(params.RpcEndpoint); err != nil {
+	if err := nns.Dial(params.RPCEndpoint); err != nil {
 		return nil, fmt.Errorf("dial nns resolver: %w", err)
 	}
 
