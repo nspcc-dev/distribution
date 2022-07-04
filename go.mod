@@ -18,9 +18,8 @@ require (
 	github.com/gorilla/mux v1.8.0
 	github.com/mitchellh/mapstructure v1.1.2
 	github.com/ncw/swift v1.0.47
-	github.com/nspcc-dev/neo-go v0.98.1
-	github.com/nspcc-dev/neo-go/examples/nft-nd-nns v0.0.0-20220204081622-62602af34544 // indirect
-	github.com/nspcc-dev/neofs-sdk-go v1.0.0-rc.1.0.20220224125909-b5874778e998
+	github.com/nspcc-dev/neo-go v0.98.2
+	github.com/nspcc-dev/neofs-sdk-go v1.0.0-rc.4.0.20220628114722-ab4d1e34a8ac
 	github.com/nspcc-dev/tzhash v1.5.2
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.0.2
@@ -88,8 +87,9 @@ require (
 	github.com/mr-tron/base58 v1.2.0 // indirect
 	github.com/nspcc-dev/go-ordered-json v0.0.0-20220111165707-25110be27d22 // indirect
 	github.com/nspcc-dev/hrw v1.0.9 // indirect
-	github.com/nspcc-dev/neo-go/pkg/interop v0.0.0-20220131192108-37ca96c20bf7 // indirect
-	github.com/nspcc-dev/neofs-api-go/v2 v2.11.2-0.20220222151918-1384523f620f // indirect
+	github.com/nspcc-dev/neo-go/pkg/interop v0.0.0-20220321113211-526c423a6152 // indirect
+	github.com/nspcc-dev/neofs-api-go/v2 v2.12.3-0.20220621170933-dd233c3fbc84 // indirect
+	github.com/nspcc-dev/neofs-contract v0.15.1 // indirect
 	github.com/nspcc-dev/neofs-crypto v0.3.0 // indirect
 	github.com/nspcc-dev/rfc6979 v0.2.0 // indirect
 	github.com/opencontainers/runc v1.0.2 // indirect

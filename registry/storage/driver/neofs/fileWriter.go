@@ -35,12 +35,12 @@ type writer struct {
 	buffer         []byte
 	written        uint64
 	splitInfo      *object.SplitInfo
-	previous       []*oid.ID
+	previous       []oid.ID
 	chunkWriter    io.Writer
 	targetInit     func() transformer.ObjectTarget
 	target         transformer.ObjectTarget
-	current        *object.RawObject
-	parent         *object.RawObject
+	current        *object.Object
+	parent         *object.Object
 	currentHashers []*payloadChecksumHasher
 	parentHashers  []*payloadChecksumHasher
 }
@@ -56,14 +56,17 @@ func newSizeLimiterWriter(ctx context.Context, d *driver, path string, splitInfo
 		lastPart *object.Object
 	)
 
+	splitLastPart, _ := splitInfo.LastPart()
+
 	for _, obj := range parts {
 		size += obj.PayloadSize()
-		if obj.ID().Equal(splitInfo.LastPart()) {
+		objID, _ := obj.ID()
+		if objID.Equals(splitLastPart) {
 			lastPart = obj
 		}
 	}
 
-	parent := d.rawObject(path)
+	parent := d.formObject(path)
 	parentHashers, err := getParentHashers(parent, lastPart)
 	if err != nil {
 		return nil, err
@@ -77,7 +80,7 @@ func newSizeLimiterWriter(ctx context.Context, d *driver, path string, splitInfo
 		path:          path,
 		written:       size,
 		splitInfo:     splitInfo,
-		previous:      formPreviousChain(splitInfo.LastPart(), parts),
+		previous:      formPreviousChain(splitInfo, parts),
 		parentHashers: parentHashers,
 		targetInit: func() transformer.ObjectTarget {
 			return d.newObjTarget(ctx)
@@ -93,7 +96,7 @@ func newSizeLimiterWriter(ctx context.Context, d *driver, path string, splitInfo
 	return wrtr, nil
 }
 
-func getParentHashers(parent *object.RawObject, lastPart *object.Object) ([]*payloadChecksumHasher, error) {
+func getParentHashers(parent *object.Object, lastPart *object.Object) ([]*payloadChecksumHasher, error) {
 	// if objects in split chain don't yet exist
 	if lastPart == nil {
 		hashers, err := payloadHashersForParentObject(parent, nil, nil)
@@ -108,7 +111,8 @@ func getParentHashers(parent *object.RawObject, lastPart *object.Object) ([]*pay
 		return nil, err
 	}
 
-	hashers, err := payloadHashersForParentObject(parent, hashState, lastPart.PayloadHomomorphicHash().Sum())
+	homoHash, _ := lastPart.PayloadHomomorphicHash()
+	hashers, err := payloadHashersForParentObject(parent, hashState, homoHash.Value())
 	if err != nil {
 		return nil, fmt.Errorf("couldn't init parent hahsers: %w", err)
 	}
@@ -130,20 +134,22 @@ func getSHAState(obj *object.Object) ([]byte, error) {
 		}
 	}
 	if hashState == nil {
-		return nil, fmt.Errorf("object '%s' has not sha state", obj.ID())
+		objID, _ := obj.ID()
+		return nil, fmt.Errorf("object '%s' has not sha state", objID)
 	}
 
 	return hashState, nil
 }
 
-func formPreviousChain(lastPartID *oid.ID, parts []*object.Object) []*oid.ID {
-	previous := make([]*oid.ID, 0, len(parts))
-	current := lastPartID
-	for current != nil {
-		previous = append([]*oid.ID{current}, previous...)
+func formPreviousChain(splitInfo *object.SplitInfo, parts []*object.Object) []oid.ID {
+	previous := make([]oid.ID, 0, len(parts))
+	current, isSet := splitInfo.LastPart()
+	for isSet {
+		previous = append([]oid.ID{current}, previous...)
 		for _, part := range parts {
-			if current.Equal(part.ID()) {
-				current = part.PreviousID()
+			partID, _ := part.ID()
+			if current.Equals(partID) {
+				current, isSet = part.PreviousID()
 				break
 			}
 		}
@@ -200,7 +206,7 @@ func (w *writer) release(withParent bool) (*transformer.AccessIdentifiers, error
 	if withParent {
 		writeHashes(w.parentHashers)
 		w.parent.SetPayloadSize(w.written)
-		w.current.SetParent(w.parent.Object())
+		w.current.SetParent(w.parent)
 	}
 
 	// release current object
@@ -313,9 +319,11 @@ func (w *writer) initializeCurrent() {
 	w.chunkWriter = io.MultiWriter(ws...)
 }
 
-func fromObject(obj *object.RawObject) *object.RawObject {
-	res := object.NewRaw()
-	res.SetContainerID(obj.ContainerID())
+func fromObject(obj *object.Object) *object.Object {
+	cnrID, _ := obj.ContainerID()
+
+	res := object.New()
+	res.SetContainerID(cnrID)
 	res.SetOwnerID(obj.OwnerID())
 	res.SetType(obj.Type())
 	res.SetSplitID(obj.SplitID())
@@ -329,14 +337,14 @@ func writeHashes(hashers []*payloadChecksumHasher) {
 	}
 }
 
-func payloadHashersForObject(obj *object.RawObject) []*payloadChecksumHasher {
+func payloadHashersForObject(obj *object.Object) []*payloadChecksumHasher {
 	return []*payloadChecksumHasher{
 		newSHAChecksumHasher(obj, sha256.New(), false),
 		newTZChecksumHasher(obj, tz.New()),
 	}
 }
 
-func payloadHashersForParentObject(parent *object.RawObject, shaState []byte, tzPrev []byte) ([]*payloadChecksumHasher, error) {
+func payloadHashersForParentObject(parent *object.Object, shaState []byte, tzPrev []byte) ([]*payloadChecksumHasher, error) {
 	shaHash := sha256.New()
 	if shaState != nil {
 		unmarshaler, ok := shaHash.(encoding.BinaryUnmarshaler)
@@ -358,7 +366,7 @@ func payloadHashersForParentObject(parent *object.RawObject, shaState []byte, tz
 	}, nil
 }
 
-func newSHAChecksumHasher(obj *object.RawObject, shaHash hash.Hash, parent bool) *payloadChecksumHasher {
+func newSHAChecksumHasher(obj *object.Object, shaHash hash.Hash, parent bool) *payloadChecksumHasher {
 	return &payloadChecksumHasher{
 		hasher: shaHash,
 		checksumWriter: func() {
@@ -371,7 +379,7 @@ func newSHAChecksumHasher(obj *object.RawObject, shaHash hash.Hash, parent bool)
 	}
 }
 
-func newTZChecksumHasher(obj *object.RawObject, tzHash hash.Hash, prevHash ...[]byte) *payloadChecksumHasher {
+func newTZChecksumHasher(obj *object.Object, tzHash hash.Hash, prevHash ...[]byte) *payloadChecksumHasher {
 	return &payloadChecksumHasher{
 		hasher: tzHash,
 		checksumWriter: func() {
@@ -389,7 +397,7 @@ func newTZChecksumHasher(obj *object.RawObject, tzHash hash.Hash, prevHash ...[]
 	}
 }
 
-func setTzHash(obj *object.RawObject, cs []byte) {
+func setTzHash(obj *object.Object, cs []byte) {
 	if ln := len(cs); ln != tzChecksumSize {
 		panic(fmt.Sprintf("wrong checksum length: expected %d, has %d", ln, tzChecksumSize))
 	}
@@ -397,12 +405,12 @@ func setTzHash(obj *object.RawObject, cs []byte) {
 	csTZ := [tzChecksumSize]byte{}
 	copy(csTZ[:], cs)
 
-	sum := checksum.New()
+	var sum checksum.Checksum
 	sum.SetTillichZemor(csTZ)
 	obj.SetPayloadHomomorphicHash(sum)
 }
 
-func setSHAHash(obj *object.RawObject, cs []byte) {
+func setSHAHash(obj *object.Object, cs []byte) {
 	if ln := len(cs); ln != sha256.Size {
 		panic(fmt.Sprintf("wrong checksum length: expected %d, has %d", ln, sha256.Size))
 	}
@@ -410,12 +418,12 @@ func setSHAHash(obj *object.RawObject, cs []byte) {
 	csSHA := [sha256.Size]byte{}
 	copy(csSHA[:], cs)
 
-	sum := checksum.New()
+	var sum checksum.Checksum
 	sum.SetSHA256(csSHA)
 	obj.SetPayloadChecksum(sum)
 }
 
-func setSHAState(obj *object.RawObject, shaHash hash.Hash) {
+func setSHAState(obj *object.Object, shaHash hash.Hash) {
 	marshaler, ok := shaHash.(encoding.BinaryMarshaler)
 	if !ok {
 		panic("expected sha256 is BinaryMarshaler")
@@ -428,7 +436,7 @@ func setSHAState(obj *object.RawObject, shaHash hash.Hash) {
 	attr := object.NewAttribute()
 	attr.SetKey(attributeSHAState)
 	attr.SetValue(hex.EncodeToString(state))
-	obj.SetAttributes(attr)
+	obj.SetAttributes(*attr)
 }
 
 func (w *writer) checkState() error {

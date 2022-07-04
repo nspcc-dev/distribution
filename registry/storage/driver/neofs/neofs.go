@@ -3,10 +3,7 @@ package neofs
 import (
 	"context"
 	"crypto/ecdsa"
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"github.com/nspcc-dev/neofs-sdk-go/version"
 	"io"
 	"path/filepath"
 	"sort"
@@ -20,16 +17,14 @@ import (
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
 	"github.com/distribution/distribution/v3/registry/storage/driver/neofs/transformer"
 	"github.com/nspcc-dev/neo-go/cli/flags"
-	rpc "github.com/nspcc-dev/neo-go/pkg/rpc/client"
 	"github.com/nspcc-dev/neo-go/pkg/wallet"
-	"github.com/nspcc-dev/neofs-sdk-go/client"
 	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
-	"github.com/nspcc-dev/neofs-sdk-go/netmap"
+	resolver "github.com/nspcc-dev/neofs-sdk-go/ns"
 	"github.com/nspcc-dev/neofs-sdk-go/object"
-	"github.com/nspcc-dev/neofs-sdk-go/object/address"
 	"github.com/nspcc-dev/neofs-sdk-go/object/id"
 	"github.com/nspcc-dev/neofs-sdk-go/pool"
-	"github.com/nspcc-dev/neofs-sdk-go/resolver"
+	"github.com/nspcc-dev/neofs-sdk-go/user"
+	"github.com/nspcc-dev/neofs-sdk-go/version"
 )
 
 const (
@@ -37,8 +32,6 @@ const (
 
 	attributeFilePath = "FilePath"
 	attributeSHAState = "sha256state"
-
-	maxObjectSizeParameter = "MaxObjectSize"
 )
 
 const (
@@ -99,9 +92,10 @@ func (n *neofsDriverFactory) Create(parameters map[string]interface{}) (storaged
 }
 
 type driver struct {
-	sdkPool     pool.Pool
+	sdkPool     *pool.Pool
+	owner       *user.ID
 	key         *ecdsa.PrivateKey
-	containerID *cid.ID
+	containerID cid.ID
 	maxSize     uint64
 }
 
@@ -308,6 +302,9 @@ func New(params DriverParameters) (*Driver, error) {
 		return nil, err
 	}
 
+	var owner user.ID
+	user.IDFromKey(&owner, acc.PrivateKey().PrivateKey.PublicKey)
+
 	sdkPool, err := createPool(ctx, acc, params)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create sdk pool: %w", err)
@@ -318,13 +315,14 @@ func New(params DriverParameters) (*Driver, error) {
 		return nil, fmt.Errorf("couldn't get max object size: %w", err)
 	}
 
-	cnrID, err := getContainerID(ctx, params)
+	cnrID, err := getContainerID(params)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get container id: %w", err)
 	}
 
 	d := &driver{
 		sdkPool:     sdkPool,
+		owner:       &owner,
 		key:         &acc.PrivateKey().PrivateKey,
 		containerID: cnrID,
 		maxSize:     maxObjectSize,
@@ -339,27 +337,13 @@ func New(params DriverParameters) (*Driver, error) {
 	}, nil
 }
 
-func getMaxObjectSize(ctx context.Context, sdkPool pool.Pool) (uint64, error) {
-	cl, _, err := sdkPool.Connection()
+func getMaxObjectSize(ctx context.Context, sdkPool *pool.Pool) (uint64, error) {
+	networkInfo, err := sdkPool.NetworkInfo(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("couldn't get connection: %w", err)
 	}
 
-	res, err := cl.NetworkInfo(ctx, client.PrmNetworkInfo{})
-	if err != nil {
-		return 0, fmt.Errorf("couldn't get network info: %w", err)
-	}
-
-	var maxObjectSize uint64
-	res.Info().NetworkConfig().IterateParameters(func(param *netmap.NetworkParameter) bool {
-		if string(param.Key()) == maxObjectSizeParameter {
-			buffer := make([]byte, 8)
-			copy(buffer, param.Value())
-			maxObjectSize = binary.LittleEndian.Uint64(buffer)
-			return true
-		}
-		return false
-	})
+	maxObjectSize := networkInfo.MaxObjectSize()
 
 	if maxObjectSize == 0 {
 		return 0, fmt.Errorf("max object size must not be zero")
@@ -368,55 +352,59 @@ func getMaxObjectSize(ctx context.Context, sdkPool pool.Pool) (uint64, error) {
 	return maxObjectSize, nil
 }
 
-func getContainerID(ctx context.Context, params DriverParameters) (*cid.ID, error) {
-	cnrID := cid.New()
-	if err := cnrID.Parse(params.ContainerID); err == nil {
+func getContainerID(params DriverParameters) (cid.ID, error) {
+	var cnrID cid.ID
+	if err := cnrID.DecodeString(params.ContainerID); err == nil {
 		return cnrID, nil
 	}
 
-	nnsResolver, err := createNnsResolver(ctx, params)
+	nnsResolver, err := createNnsResolver(params)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't create nns resolver: %w", err)
+		return cid.ID{}, fmt.Errorf("couldn't create nns resolver: %w", err)
 	}
 
 	if cnrID, err = nnsResolver.ResolveContainerName(params.ContainerID); err != nil {
-		return nil, fmt.Errorf("couldn't resolve container name '%s': %w", params.ContainerID, err)
+		return cid.ID{}, fmt.Errorf("couldn't resolve container name '%s': %w", params.ContainerID, err)
 	}
 
 	return cnrID, nil
 }
 
-func createPool(ctx context.Context, acc *wallet.Account, param DriverParameters) (pool.Pool, error) {
-	pb := new(pool.Builder)
+func createPool(ctx context.Context, acc *wallet.Account, param DriverParameters) (*pool.Pool, error) {
+	var prm pool.InitParameters
+	prm.SetKey(&acc.PrivateKey().PrivateKey)
+	prm.SetNodeDialTimeout(param.ConnectionTimeout)
+	prm.SetHealthcheckTimeout(param.RequestTimeout)
+	prm.SetClientRebalanceInterval(param.RebalanceInterval)
+	prm.SetSessionExpirationDuration(param.SessionExpirationDuration)
 
 	for _, peer := range param.Peers {
-		pb.AddNode(peer.Address, peer.Priority, peer.Weight)
+		prm.AddNode(pool.NewNodeParam(peer.Priority, peer.Address, peer.Weight))
 	}
 
-	opts := &pool.BuilderOptions{
-		Key:                       &acc.PrivateKey().PrivateKey,
-		NodeConnectionTimeout:     param.ConnectionTimeout,
-		NodeRequestTimeout:        param.RequestTimeout,
-		ClientRebalanceInterval:   param.RebalanceInterval,
-		SessionExpirationDuration: param.SessionExpirationDuration,
+	p, err := pool.NewPool(prm)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
 	}
 
-	return pb.Build(ctx, opts)
+	if err = p.Dial(ctx); err != nil {
+		return nil, fmt.Errorf("dial pool: %w", err)
+	}
+
+	return p, nil
 }
 
-func createNnsResolver(ctx context.Context, params DriverParameters) (resolver.NNSResolver, error) {
+func createNnsResolver(params DriverParameters) (*resolver.NNS, error) {
 	if params.RpcEndpoint == "" {
 		return nil, fmt.Errorf("empty rpc endpoind")
 	}
-	cli, err := rpc.New(ctx, params.RpcEndpoint, rpc.Options{})
-	if err != nil {
-		return nil, err
-	}
-	if err = cli.Init(); err != nil {
-		return nil, err
+
+	var nns resolver.NNS
+	if err := nns.Dial(params.RpcEndpoint); err != nil {
+		return nil, fmt.Errorf("dial nns resolver: %w", err)
 	}
 
-	return resolver.NewNNSResolver(cli)
+	return &nns, nil
 }
 
 func getAccount(walletInfo *Wallet) (*wallet.Account, error) {
@@ -441,14 +429,14 @@ func getAccount(walletInfo *Wallet) (*wallet.Account, error) {
 	return acc, nil
 }
 
-func (d *driver) objectAddress(oid *oid.ID) *address.Address {
-	addr := address.NewAddress()
-	addr.SetContainerID(d.containerID)
-	addr.SetObjectID(oid)
+func (d *driver) objectAddress(objID oid.ID) oid.Address {
+	var addr oid.Address
+	addr.SetContainer(d.containerID)
+	addr.SetObject(objID)
 	return addr
 }
 
-func (d *driver) rawObject(path string) *object.RawObject {
+func (d *driver) formObject(path string) *object.Object {
 	attrFilePath := object.NewAttribute()
 	attrFilePath.SetKey(attributeFilePath)
 	attrFilePath.SetValue(path)
@@ -461,12 +449,12 @@ func (d *driver) rawObject(path string) *object.RawObject {
 	attrTimestamp.SetKey(object.AttributeTimestamp)
 	attrTimestamp.SetValue(strconv.FormatInt(time.Now().UTC().Unix(), 10))
 
-	raw := object.NewRaw()
-	raw.SetOwnerID(d.sdkPool.OwnerID())
-	raw.SetContainerID(d.containerID)
-	raw.SetAttributes(attrFilePath, attrFileName, attrTimestamp)
+	obj := object.New()
+	obj.SetOwnerID(d.owner)
+	obj.SetContainerID(d.containerID)
+	obj.SetAttributes(*attrFilePath, *attrFileName, *attrTimestamp)
 
-	return raw
+	return obj
 }
 
 func (d *driver) Name() string {
@@ -479,7 +467,10 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 
-	obj, err := d.sdkPool.GetObject(ctx, *d.objectAddress(id))
+	var prm pool.PrmObjectGet
+	prm.SetAddress(d.objectAddress(id))
+
+	obj, err := d.sdkPool.GetObject(ctx, prm)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get object '%s': %w", id, err)
 	}
@@ -492,10 +483,13 @@ func (d *driver) PutContent(ctx context.Context, path string, content []byte) er
 		return fmt.Errorf("couldn't delete '%s': %s", path, err)
 	}
 
-	rawObject := d.rawObject(path)
-	rawObject.SetPayload(content)
+	obj := d.formObject(path)
+	obj.SetPayload(content)
 
-	if _, err := d.sdkPool.PutObject(ctx, *rawObject.Object(), nil); err != nil {
+	var prm pool.PrmObjectPut
+	prm.SetHeader(*obj)
+
+	if _, err := d.sdkPool.PutObject(ctx, prm); err != nil {
 		return fmt.Errorf("couldn't put object '%s': %w", path, err)
 	}
 
@@ -510,7 +504,10 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 
 	addr := d.objectAddress(id)
 
-	obj, err := d.sdkPool.HeadObject(ctx, *addr)
+	var prmHead pool.PrmObjectHead
+	prmHead.SetAddress(addr)
+
+	obj, err := d.sdkPool.HeadObject(ctx, prmHead)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't head object '%s', id '%s': %w", path, id, err)
 	}
@@ -521,7 +518,12 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 
 	length := obj.PayloadSize() - uint64(offset)
 
-	res, err := d.sdkPool.ObjectRange(ctx, *addr, uint64(offset), length)
+	var prmRange pool.PrmObjectRange
+	prmRange.SetAddress(addr)
+	prmRange.SetOffset(uint64(offset))
+	prmRange.SetLength(length)
+
+	res, err := d.sdkPool.ObjectRange(ctx, prmRange)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get payload range of object '%s', offset %d, length %d, id '%s': %w",
 			path, offset, length, id, err)
@@ -541,48 +543,30 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 		return nil, fmt.Errorf("couldn't parse split id as upload uuid '%s': %w", uploadUUID, err)
 	}
 
-	ids, err := d.searchSplitParts(ctx, splitID)
+	parts, noChild, err := d.headSplitParts(ctx, splitID, path, append)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't search split parts '%s': %w", path, err)
 	}
 
-	if !append && len(ids) > 0 {
-		return nil, fmt.Errorf("init upload part '%s' already exist, splitID '%s'", path, splitID)
-	}
-
 	splitInfo := object.NewSplitInfo()
 	splitInfo.SetSplitID(splitID)
-
-	noChild := make(map[string]struct{}, len(ids))
-
-	parts := make([]*object.Object, len(ids))
-	for i, id := range ids {
-		obj, err := d.sdkPool.HeadObject(ctx, *d.objectAddress(&id))
-		if err != nil {
-			return nil, fmt.Errorf("couldn't head object part '%s', id '%s', splitID '%s': %w", path, id, splitID, err)
-		}
-		parts[i] = obj
-		noChild[obj.ID().String()] = struct{}{}
-	}
 
 	for _, obj := range parts {
 		if obj.Parent() != nil {
 			return nil, fmt.Errorf("object already exist '%s'", path)
 		}
 
-		delete(noChild, obj.PreviousID().String())
+		prevID, _ := obj.PreviousID()
+		delete(noChild, prevID)
 	}
 
 	if len(noChild) > 1 {
 		return nil, fmt.Errorf("couldn't find last part '%s'", path)
 	}
 
-	for key := range noChild {
-		lastPartID := oid.NewID()
-		if err = lastPartID.Parse(key); err != nil {
-			return nil, fmt.Errorf("couldn't parse last part id '%s': %w", key, err)
-		}
+	for lastPartID := range noChild {
 		splitInfo.SetLastPart(lastPartID)
+		break
 	}
 
 	wrtr, err := newSizeLimiterWriter(ctx, d, path, splitInfo, parts)
@@ -595,34 +579,39 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
 	if path == "/" { // healthcheck
-		if _, _, err := d.sdkPool.Connection(); err != nil {
+		if _, err := d.sdkPool.NetworkInfo(ctx); err != nil {
 			return nil, fmt.Errorf("healthcheck failed: %w", err)
 		}
 		return newFileInfoDir(path), nil
 	}
 
-	ids, err := d.searchByPrefix(ctx, path)
+	id, ok, err := d.searchOneBase(ctx, path, true)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(ids) == 0 {
-		return nil, storagedriver.PathNotFoundError{Path: path, DriverName: driverName}
-	}
-
 	// assume there is not object with directory name
 	// e.g. if file '/a/b/c' exists, files '/a/b' and '/a' don't
-	if len(ids) > 1 {
+	if !ok {
 		return newFileInfoDir(path), nil
 	}
 
-	id := ids[0]
-	obj, err := d.sdkPool.HeadObject(ctx, *d.objectAddress(&id))
+	var prm pool.PrmObjectHead
+	prm.SetAddress(d.objectAddress(id))
+
+	obj, err := d.sdkPool.HeadObject(ctx, prm)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get head object '%s': %w", id, err)
 	}
 
 	fileInfo := newFileInfo(ctx, obj, "")
+
+	// e.g. search '/a/b' but because of prefix search we found '/a/b/c'
+	// so we should return directory
+	if fileInfo.Path() != path {
+		return newFileInfoDir(path), nil
+	}
+
 	return fileInfo, nil
 }
 
@@ -636,7 +625,10 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 
 	result := make([]string, 0, len(ids))
 	for _, id := range ids {
-		obj, err := d.sdkPool.HeadObject(ctx, *d.objectAddress(&id))
+		var prm pool.PrmObjectHead
+		prm.SetAddress(d.objectAddress(id))
+
+		obj, err := d.sdkPool.HeadObject(ctx, prm)
 		if err != nil {
 			dcontext.GetLogger(ctx).Warnf("couldn't get list object '%s' in path '%s': %s", id, path, err)
 			continue
@@ -663,7 +655,12 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 		return fmt.Errorf("couldn't delete '%s' object:  %w", destPath, err)
 	}
 
-	obj, err := d.sdkPool.GetObject(ctx, *d.objectAddress(sourceID))
+	sourceAddr := d.objectAddress(sourceID)
+
+	var prmGet pool.PrmObjectGet
+	prmGet.SetAddress(sourceAddr)
+
+	obj, err := d.sdkPool.GetObject(ctx, prmGet)
 	if err != nil {
 		return fmt.Errorf("could not get source object '%s' by oid '%s': %w", sourcePath, sourceID, err)
 	}
@@ -674,12 +671,19 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 		}
 	}()
 
-	rawObj := d.rawObject(destPath)
-	if _, err = d.sdkPool.PutObject(ctx, *rawObj.Object(), obj.Payload); err != nil {
+	objHeader := d.formObject(destPath)
+	var prmPut pool.PrmObjectPut
+	prmPut.SetHeader(*objHeader)
+	prmPut.SetPayload(obj.Payload)
+
+	if _, err = d.sdkPool.PutObject(ctx, prmPut); err != nil {
 		return fmt.Errorf("couldn't put object '%s': %w", destPath, err)
 	}
 
-	if err = d.sdkPool.DeleteObject(ctx, *d.objectAddress(sourceID)); err != nil {
+	var prmDelete pool.PrmObjectDelete
+	prmDelete.SetAddress(sourceAddr)
+
+	if err = d.sdkPool.DeleteObject(ctx, prmDelete); err != nil {
 		return fmt.Errorf("couldn't remove source file '%s', id '%s': %w", sourcePath, sourceID, err)
 	}
 
@@ -687,21 +691,43 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 }
 
 func (d *driver) Delete(ctx context.Context, path string) error {
-	ids, err := d.search(ctx, path)
+	filters := object.NewSearchFilters()
+	filters.AddRootFilter()
+	filters.AddFilter(attributeFilePath, path, object.MatchStringEqual)
+
+	var prmSearch pool.PrmObjectSearch
+	prmSearch.SetContainerID(d.containerID)
+	prmSearch.SetFilters(filters)
+
+	res, err := d.sdkPool.SearchObjects(ctx, prmSearch)
 	if err != nil {
-		return fmt.Errorf("couldn't search '%s': %s", path, err)
+		return fmt.Errorf("init searching using client: %w", err)
 	}
 
-	for _, id := range ids {
-		if err = d.delete(ctx, &id); err != nil {
-			return fmt.Errorf("couldn't delete object by path '%s': %w", path, err)
+	defer res.Close()
+
+	var inErr error
+	err = res.Iterate(func(id oid.ID) bool {
+		if err = d.delete(ctx, id); err != nil {
+			inErr = fmt.Errorf("couldn't delete object by path '%s': %w", path, err)
+			return true
 		}
+		return false
+	})
+	if err == nil {
+		err = inErr
 	}
+	if err != nil {
+		return fmt.Errorf("iterate objects: %w", err)
+	}
+
 	return nil
 }
 
-func (d *driver) delete(ctx context.Context, id *oid.ID) error {
-	if err := d.sdkPool.DeleteObject(ctx, *d.objectAddress(id)); err != nil {
+func (d *driver) delete(ctx context.Context, id oid.ID) error {
+	var prm pool.PrmObjectDelete
+	prm.SetAddress(d.objectAddress(id))
+	if err := d.sdkPool.DeleteObject(ctx, prm); err != nil {
 		return fmt.Errorf("couldn't delete object '%s': %w", id, err)
 	}
 
@@ -716,14 +742,6 @@ func (d *driver) Walk(ctx context.Context, path string, fn storagedriver.WalkFn)
 	return storagedriver.WalkFallback(ctx, d, path, fn)
 }
 
-func (d *driver) search(ctx context.Context, path string) ([]oid.ID, error) {
-	filters := object.NewSearchFilters()
-	filters.AddRootFilter()
-	filters.AddFilter(attributeFilePath, path, object.MatchStringEqual)
-
-	return d.baseSearch(ctx, filters)
-}
-
 func (d *driver) searchByPrefix(ctx context.Context, prefix string) ([]oid.ID, error) {
 	filters := object.NewSearchFilters()
 	filters.AddRootFilter()
@@ -732,67 +750,138 @@ func (d *driver) searchByPrefix(ctx context.Context, prefix string) ([]oid.ID, e
 	return d.baseSearch(ctx, filters)
 }
 
-func (d *driver) searchSplitParts(ctx context.Context, splitID *object.SplitID) ([]oid.ID, error) {
+func (d *driver) headSplitParts(ctx context.Context, splitID *object.SplitID, path string, isAppend bool) ([]*object.Object, map[oid.ID]struct{}, error) {
 	filters := object.NewSearchFilters()
 	filters.AddPhyFilter()
 	filters.AddSplitIDFilter(object.MatchStringEqual, splitID)
 
-	return d.baseSearch(ctx, filters)
+	var prm pool.PrmObjectSearch
+	prm.SetContainerID(d.containerID)
+	prm.SetFilters(filters)
+
+	res, err := d.sdkPool.SearchObjects(ctx, prm)
+	if err != nil {
+		return nil, nil, fmt.Errorf("init searching using client: %w", err)
+	}
+
+	defer res.Close()
+
+	var addr oid.Address
+	addr.SetContainer(d.containerID)
+
+	var inErr error
+	var prmHead pool.PrmObjectHead
+
+	var objects []*object.Object
+	noChild := make(map[oid.ID]struct{})
+
+	err = res.Iterate(func(id oid.ID) bool {
+		addr.SetObject(id)
+		prmHead.SetAddress(addr)
+
+		obj, err := d.sdkPool.HeadObject(ctx, prmHead)
+		if err != nil {
+			inErr = fmt.Errorf("couldn't head object part '%s', id '%s', splitID '%s': %w", path, id, splitID, err)
+			return true
+		}
+
+		if isAppend {
+			objects = append(objects, obj)
+			noChild[id] = struct{}{}
+			return false
+		}
+
+		inErr = fmt.Errorf("init upload part '%s' already exist, splitID '%s'", path, splitID)
+		return true
+	})
+	if err == nil {
+		err = inErr
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("iterate objects: %w", err)
+	}
+
+	return objects, noChild, nil
 }
 
 func (d *driver) baseSearch(ctx context.Context, filters object.SearchFilters) ([]oid.ID, error) {
-	res, err := d.sdkPool.SearchObjects(ctx, *d.containerID, filters)
+	var prm pool.PrmObjectSearch
+	prm.SetContainerID(d.containerID)
+	prm.SetFilters(filters)
+
+	res, err := d.sdkPool.SearchObjects(ctx, prm)
 	if err != nil {
 		return nil, fmt.Errorf("init searching using client: %w", err)
 	}
 
 	defer res.Close()
 
-	var num, read int
-	buf := make([]oid.ID, 10)
+	var buf []oid.ID
 
-	for {
-		num, err = res.Read(buf[read:])
-		if num > 0 {
-			read += num
-			buf = append(buf, oid.ID{})
-			buf = buf[:cap(buf)]
-		}
-
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-
-			return nil, fmt.Errorf("couldn't read found objects: %w", err)
-		}
-	}
-
-	return buf[:read], nil
-}
-
-func (d *driver) searchOne(ctx context.Context, path string) (*oid.ID, error) {
-	ids, err := d.search(ctx, path)
-	return handleSearchResponse(path, ids, err)
-}
-
-func handleSearchResponse(path string, ids []oid.ID, err error) (*oid.ID, error) {
+	err = res.Iterate(func(id oid.ID) bool {
+		buf = append(buf, id)
+		return false
+	})
 	if err != nil {
-		return nil, fmt.Errorf("couldn't search path '%s': %w", path, err)
+		return nil, fmt.Errorf("iterate objects: %w", err)
 	}
 
-	if len(ids) == 0 {
-		return nil, storagedriver.PathNotFoundError{
-			Path:       path,
-			DriverName: driverName,
+	return buf, nil
+}
+
+func (d *driver) searchOne(ctx context.Context, path string) (oid.ID, error) {
+	id, ok, err := d.searchOneBase(ctx, path, false)
+	if err != nil {
+		return oid.ID{}, err
+	}
+
+	if !ok {
+		return oid.ID{}, fmt.Errorf("found more than one object by path '%s'", path)
+	}
+
+	return id, nil
+}
+
+func (d *driver) searchOneBase(ctx context.Context, path string, byPrefix bool) (resID oid.ID, ok bool, err error) {
+	filters := object.NewSearchFilters()
+	filters.AddRootFilter()
+	if byPrefix {
+		filters.AddFilter(attributeFilePath, path, object.MatchCommonPrefix)
+	} else {
+		filters.AddFilter(attributeFilePath, path, object.MatchStringEqual)
+	}
+
+	var prm pool.PrmObjectSearch
+	prm.SetContainerID(d.containerID)
+	prm.SetFilters(filters)
+
+	res, err := d.sdkPool.SearchObjects(ctx, prm)
+	if err != nil {
+		return oid.ID{}, false, fmt.Errorf("init searching using client: %w", err)
+	}
+
+	defer res.Close()
+
+	var found bool
+	err = res.Iterate(func(id oid.ID) bool {
+		if found {
+			ok = false
+			return true
 		}
+		found = true
+		resID = id
+		ok = true
+		return false
+	})
+	if err != nil {
+		return oid.ID{}, false, fmt.Errorf("iterate objects by path '%s': %w", path, err)
 	}
 
-	if len(ids) > 1 {
-		return nil, fmt.Errorf("found %d objects by path '%s'", len(ids), path)
+	if !found {
+		return oid.ID{}, false, storagedriver.PathNotFoundError{Path: path, DriverName: driverName}
 	}
 
-	return &ids[0], nil
+	return resID, ok, nil
 }
 
 func newFileInfo(ctx context.Context, obj *object.Object, prefix string) storagedriver.FileInfo {
@@ -807,7 +896,8 @@ func newFileInfo(ctx context.Context, obj *object.Object, prefix string) storage
 		case object.AttributeTimestamp:
 			timestamp, err := strconv.ParseInt(attr.Value(), 10, 64)
 			if err != nil {
-				dcontext.GetLogger(ctx).Warnf("object '%s' has invalid timestamp '%s'", obj.ID(), attr.Value())
+				objID, _ := obj.ID()
+				dcontext.GetLogger(ctx).Warnf("object '%s' has invalid timestamp '%s'", objID.EncodeToString(), attr.Value())
 				continue
 			}
 			fileInfoFields.ModTime = time.Unix(timestamp, 0)
@@ -848,13 +938,13 @@ func (d *driver) newObjTarget(ctx context.Context) transformer.ObjectTarget {
 
 type objTarget struct {
 	ctx     context.Context
-	sdkPool pool.Pool
+	sdkPool *pool.Pool
 	key     *ecdsa.PrivateKey
-	obj     *object.RawObject
+	obj     *object.Object
 	chunks  [][]byte
 }
 
-func (t *objTarget) WriteHeader(obj *object.RawObject) error {
+func (t *objTarget) WriteHeader(obj *object.Object) error {
 	t.obj = obj
 	return nil
 }
@@ -865,14 +955,9 @@ func (t *objTarget) Write(p []byte) (n int, err error) {
 }
 
 func (t *objTarget) Close() (*transformer.AccessIdentifiers, error) {
-	conn, _, err := t.sdkPool.Connection()
+	networkInfo, err := t.sdkPool.NetworkInfo(t.ctx)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't get connection: %w", err)
-	}
-
-	netInfoRes, err := conn.NetworkInfo(t.ctx, client.PrmNetworkInfo{})
-	if err != nil {
-		return nil, fmt.Errorf("couldn't get netrwork info: %w", err)
+		return nil, fmt.Errorf("couldn't get network info: %w", err)
 	}
 
 	sz := 0
@@ -880,31 +965,33 @@ func (t *objTarget) Close() (*transformer.AccessIdentifiers, error) {
 		sz += len(t.chunks[i])
 	}
 
+	ver := version.Current()
+	currEpoch := networkInfo.CurrentEpoch()
+
 	t.obj.SetPayloadSize(uint64(sz))
-	t.obj.SetVersion(version.Current())
-	t.obj.SetCreationEpoch(netInfoRes.Info().CurrentEpoch())
+	t.obj.SetVersion(&ver)
+	t.obj.SetCreationEpoch(currEpoch)
 
 	var (
-		parID  *oid.ID
+		parID  oid.ID
 		parHdr *object.Object
 	)
 
 	if par := t.obj.Parent(); par != nil && par.Signature() == nil {
-		rawPar := object.NewRawFromV2(par.ToV2())
+		objPar := object.NewFromV2(par.ToV2())
 
-		rawPar.SetCreationEpoch(netInfoRes.Info().CurrentEpoch())
+		objPar.SetCreationEpoch(currEpoch)
 
-		if err := object.SetIDWithSignature(t.key, rawPar); err != nil {
+		if err := object.SetIDWithSignature(*t.key, objPar); err != nil {
 			return nil, fmt.Errorf("could not finalize parent object: %w", err)
 		}
 
-		parID = rawPar.ID()
-		parHdr = rawPar.Object()
+		parID, _ = objPar.ID()
 
-		t.obj.SetParent(parHdr)
+		t.obj.SetParent(objPar)
 	}
 
-	if err := object.SetIDWithSignature(t.key, t.obj); err != nil {
+	if err = object.SetIDWithSignature(*t.key, t.obj); err != nil {
 		return nil, fmt.Errorf("could not finalize object: %w", err)
 	}
 
@@ -914,13 +1001,18 @@ func (t *objTarget) Close() (*transformer.AccessIdentifiers, error) {
 	}
 	t.obj.SetPayload(payload)
 
-	_, err = t.sdkPool.PutObject(t.ctx, *t.obj.Object(), nil)
+	var prm pool.PrmObjectPut
+	prm.SetHeader(*t.obj)
+
+	_, err = t.sdkPool.PutObject(t.ctx, prm)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't put part: %w", err)
 	}
 
+	objID, _ := t.obj.ID()
+
 	return new(transformer.AccessIdentifiers).
-		WithSelfID(t.obj.ID()).
-		WithParentID(parID).
+		WithSelfID(objID).
+		WithParentID(&parID).
 		WithParent(parHdr), nil
 }
