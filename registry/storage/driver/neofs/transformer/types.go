@@ -3,7 +3,7 @@ package transformer
 import (
 	"io"
 
-	object "github.com/nspcc-dev/neofs-sdk-go/object"
+	"github.com/nspcc-dev/neofs-sdk-go/object"
 	oid "github.com/nspcc-dev/neofs-sdk-go/object/id"
 )
 
@@ -11,7 +11,9 @@ import (
 // that are returned after writing the object.
 // Consists of the ID of the stored object and the ID of the parent object.
 type AccessIdentifiers struct {
-	par, self *oid.ID
+	par *oid.ID
+
+	self oid.ID
 
 	parHdr *object.Object
 }
@@ -50,16 +52,12 @@ type ObjectTarget interface {
 type TargetInitializer func() ObjectTarget
 
 // SelfID returns identifier of the written object.
-func (a *AccessIdentifiers) SelfID() *oid.ID {
-	if a != nil {
-		return a.self
-	}
-
-	return nil
+func (a *AccessIdentifiers) SelfID() oid.ID {
+	return a.self
 }
 
 // WithSelfID returns AccessIdentifiers with passed self identifier.
-func (a *AccessIdentifiers) WithSelfID(v *oid.ID) *AccessIdentifiers {
+func (a *AccessIdentifiers) WithSelfID(v oid.ID) *AccessIdentifiers {
 	res := a
 	if res == nil {
 		res = new(AccessIdentifiers)

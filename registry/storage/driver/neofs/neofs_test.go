@@ -17,8 +17,9 @@ import (
 	"github.com/nspcc-dev/neo-go/pkg/wallet"
 	"github.com/nspcc-dev/neofs-sdk-go/container"
 	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
-	"github.com/nspcc-dev/neofs-sdk-go/policy"
+	"github.com/nspcc-dev/neofs-sdk-go/netmap"
 	"github.com/nspcc-dev/neofs-sdk-go/pool"
+	"github.com/nspcc-dev/neofs-sdk-go/user"
 	"github.com/nspcc-dev/neofs-sdk-go/version"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -30,7 +31,7 @@ const (
 	aioNodeEndpoint = "localhost:8080"
 )
 
-func params(walletPath string, containerID *cid.ID) map[string]interface{} {
+func params(walletPath string, containerID cid.ID) map[string]interface{} {
 	return map[string]interface{}{
 		paramWallet: map[interface{}]interface{}{
 			paramPath:     walletPath,
@@ -59,6 +60,9 @@ func TestIntegration(t *testing.T) {
 	key, err := keys.NewPrivateKeyFromHex("1dd37fba80fec4e6a6f13fd708d8dcb3b29def768017052f6c930fa1c5d90bbb")
 	require.NoError(t, err)
 
+	var owner user.ID
+	user.IDFromKey(&owner, key.PrivateKey.PublicKey)
+
 	w, err := wallet.NewWallet(f.Name())
 	require.NoError(t, err)
 
@@ -72,26 +76,32 @@ func TestIntegration(t *testing.T) {
 
 	rootCtx := context.Background()
 	aioImage := "nspccdev/neofs-aio-testcontainer:"
-	versions := []string{"0.27.5", "latest"}
+	versions := []string{
+		"0.27.5",
+		"0.28.1",
+		"latest",
+	}
 
-	for _, version := range versions {
+	for _, aioVersion := range versions {
 		ctx, cancel := context.WithCancel(rootCtx)
-		aioContainer := createDockerContainer(ctx, t, aioImage+version)
+		aioContainer := createDockerContainer(ctx, t, aioImage+aioVersion)
 
 		sdkPool := getPool(ctx, t, key)
-		CID := createContainer(ctx, t, sdkPool)
+		cnrID := createContainer(ctx, t, sdkPool, &owner)
 
-		drvr, err := FromParameters(params(f.Name(), CID))
+		drvr, err := FromParameters(params(f.Name(), cnrID))
 		require.NoError(t, err)
 
 		drvrImpl := drvr.(*Driver).StorageDriver.(*driver)
 		maxObjectSize := drvrImpl.maxSize
 
-		t.Run("move "+version, func(t *testing.T) { testMove(ctx, t, drvr, version) })
-		t.Run("set get content "+version, func(t *testing.T) { testSetContent(ctx, t, drvr, version) })
-		t.Run("simple write "+version, func(t *testing.T) { testSimpleWrite(ctx, t, drvr, maxObjectSize, version) })
-		t.Run("resume write "+version, func(t *testing.T) { testResumeWrite(ctx, t, drvr, maxObjectSize, version) })
-		t.Run("write read "+version, func(t *testing.T) { testWriteRead(ctx, t, drvr, maxObjectSize, version) })
+		t.Run("move "+aioVersion, func(t *testing.T) { testMove(ctx, t, drvr, aioVersion) })
+		t.Run("set get content "+aioVersion, func(t *testing.T) { testSetContent(ctx, t, drvr, aioVersion) })
+		t.Run("simple write "+aioVersion, func(t *testing.T) { testSimpleWrite(ctx, t, drvr, maxObjectSize, aioVersion) })
+		t.Run("resume write "+aioVersion, func(t *testing.T) { testResumeWrite(ctx, t, drvr, maxObjectSize, aioVersion) })
+		t.Run("write read "+aioVersion, func(t *testing.T) { testWriteRead(ctx, t, drvr, maxObjectSize, aioVersion) })
+		t.Run("list "+aioVersion, func(t *testing.T) { testList(ctx, t, drvr, aioVersion) })
+		t.Run("stat "+aioVersion, func(t *testing.T) { testStat(ctx, t, drvr, aioVersion) })
 
 		err = aioContainer.Terminate(ctx)
 		require.NoError(t, err)
@@ -205,6 +215,60 @@ func testWriteRead(rootCtx context.Context, t *testing.T, drvr storagedriver.Sto
 	require.NoError(t, err)
 }
 
+func testList(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+	ctx, path := formCtxAndPath(rootCtx, version)
+
+	fileWriter, err := drvr.Writer(ctx, path, false)
+	require.NoError(t, err)
+
+	dataSize := 4096
+	data := make([]byte, dataSize)
+	_, err = rand.Read(data)
+	require.NoError(t, err)
+
+	_, err = io.Copy(fileWriter, bytes.NewReader(data))
+	require.NoError(t, err)
+
+	err = fileWriter.Commit()
+	require.NoError(t, err)
+
+	res, err := drvr.List(ctx, path)
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	require.Contains(t, res, path)
+}
+
+func testStat(rootCtx context.Context, t *testing.T, drvr storagedriver.StorageDriver, version string) {
+	ctx, path := formCtxAndPath(rootCtx, version)
+
+	fileWriter, err := drvr.Writer(ctx, path, false)
+	require.NoError(t, err)
+
+	dataSize := 4096
+	data := make([]byte, dataSize)
+	_, err = rand.Read(data)
+	require.NoError(t, err)
+
+	_, err = io.Copy(fileWriter, bytes.NewReader(data))
+	require.NoError(t, err)
+
+	err = fileWriter.Commit()
+	require.NoError(t, err)
+
+	fi, err := drvr.Stat(ctx, path)
+	require.NoError(t, err)
+	require.False(t, fi.IsDir())
+	require.Equal(t, path, fi.Path())
+
+	fi, err = drvr.Stat(ctx, "/dummy")
+	require.Error(t, err)
+
+	fi, err = drvr.Stat(ctx, "/test/file/"+version)
+	require.NoError(t, err)
+	require.True(t, fi.IsDir())
+	require.Equal(t, "/test/file/"+version, fi.Path())
+}
+
 func writeAndCheck(ctx context.Context, t *testing.T, drvr storagedriver.StorageDriver, maxObjectSize uint64, path string, append bool) {
 	fileWriter, err := drvr.Writer(ctx, path, append)
 	require.NoError(t, err)
@@ -242,40 +306,44 @@ func createDockerContainer(ctx context.Context, t *testing.T, image string) test
 	return aioC
 }
 
-func getPool(ctx context.Context, t *testing.T, key *keys.PrivateKey) pool.Pool {
-	pb := new(pool.Builder)
-	pb.AddNode(aioNodeEndpoint, 1, 1)
+func getPool(ctx context.Context, t *testing.T, key *keys.PrivateKey) *pool.Pool {
+	var prm pool.InitParameters
+	prm.SetKey(&key.PrivateKey)
+	prm.SetNodeDialTimeout(5 * time.Second)
+	prm.AddNode(pool.NewNodeParam(1, aioNodeEndpoint, 1))
 
-	opts := &pool.BuilderOptions{
-		Key:                   &key.PrivateKey,
-		NodeConnectionTimeout: 5 * time.Second,
-		NodeRequestTimeout:    5 * time.Second,
-	}
-	clientPool, err := pb.Build(ctx, opts)
+	p, err := pool.NewPool(prm)
 	require.NoError(t, err)
-	return clientPool
+
+	err = p.Dial(ctx)
+	require.NoError(t, err)
+
+	return p
 }
 
-func createContainer(ctx context.Context, t *testing.T, clientPool pool.Pool) *cid.ID {
-	pp, err := policy.Parse("REP 1")
+func createContainer(ctx context.Context, t *testing.T, clientPool *pool.Pool, owner *user.ID) cid.ID {
+	var policy netmap.PlacementPolicy
+	err := policy.DecodeString("REP 1")
 	require.NoError(t, err)
 
 	cnr := container.New(
-		container.WithPolicy(pp),
+		container.WithPolicy(&policy),
 		container.WithCustomBasicACL(0x0FFFFFFF),
 		container.WithAttribute(container.AttributeTimestamp, strconv.FormatInt(time.Now().Unix(), 10)))
-	cnr.SetOwnerID(clientPool.OwnerID())
-	cnr.SetVersion(version.Current())
+	cnr.SetOwnerID(owner)
+	ver := version.Current()
+	cnr.SetVersion(&ver)
 
-	CID, err := clientPool.PutContainer(ctx, cnr)
+	var wp pool.WaitParams
+	wp.SetTimeout(30 * time.Second)
+	wp.SetPollInterval(3 * time.Second)
+
+	var prm pool.PrmContainerPut
+	prm.SetContainer(*cnr)
+
+	cnrID, err := clientPool.PutContainer(ctx, prm)
 	require.NoError(t, err)
-	fmt.Println(CID.String())
+	fmt.Println(cnrID.EncodeToString())
 
-	err = clientPool.WaitForContainerPresence(ctx, CID, &pool.ContainerPollingParams{
-		CreationTimeout: 30 * time.Second,
-		PollInterval:    3 * time.Second,
-	})
-	require.NoError(t, err)
-
-	return CID
+	return *cnrID
 }
