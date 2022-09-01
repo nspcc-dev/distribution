@@ -529,7 +529,7 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 			path, offset, length, id, err)
 	}
 
-	return res, nil
+	return &res, nil
 }
 
 func getUploadUUID(ctx context.Context) (uuid string) {
@@ -786,7 +786,7 @@ func (d *driver) headSplitParts(ctx context.Context, splitID *object.SplitID, pa
 		}
 
 		if isAppend {
-			objects = append(objects, obj)
+			objects = append(objects, &obj)
 			noChild[id] = struct{}{}
 			return false
 		}
@@ -884,7 +884,7 @@ func (d *driver) searchOneBase(ctx context.Context, path string, byPrefix bool) 
 	return resID, ok, nil
 }
 
-func newFileInfo(ctx context.Context, obj *object.Object, prefix string) storagedriver.FileInfo {
+func newFileInfo(ctx context.Context, obj object.Object, prefix string) storagedriver.FileInfo {
 	fileInfoFields := storagedriver.FileInfoFields{
 		Size: int64(obj.PayloadSize()),
 	}
