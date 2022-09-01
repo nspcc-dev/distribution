@@ -7,7 +7,6 @@ import (
 	"io"
 	"math/rand"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
@@ -20,7 +19,6 @@ import (
 	"github.com/nspcc-dev/neofs-sdk-go/netmap"
 	"github.com/nspcc-dev/neofs-sdk-go/pool"
 	"github.com/nspcc-dev/neofs-sdk-go/user"
-	"github.com/nspcc-dev/neofs-sdk-go/version"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -79,6 +77,7 @@ func TestIntegration(t *testing.T) {
 	versions := []string{
 		"0.27.5",
 		"0.28.1",
+		"0.29.0",
 		"latest",
 	}
 
@@ -87,7 +86,7 @@ func TestIntegration(t *testing.T) {
 		aioContainer := createDockerContainer(ctx, t, aioImage+aioVersion)
 
 		sdkPool := getPool(ctx, t, key)
-		cnrID := createContainer(ctx, t, sdkPool, &owner)
+		cnrID := createContainer(ctx, t, sdkPool, owner)
 
 		drvr, err := FromParameters(params(f.Name(), cnrID))
 		require.NoError(t, err)
@@ -321,29 +320,29 @@ func getPool(ctx context.Context, t *testing.T, key *keys.PrivateKey) *pool.Pool
 	return p
 }
 
-func createContainer(ctx context.Context, t *testing.T, clientPool *pool.Pool, owner *user.ID) cid.ID {
+func createContainer(ctx context.Context, t *testing.T, clientPool *pool.Pool, owner user.ID) cid.ID {
 	var policy netmap.PlacementPolicy
 	err := policy.DecodeString("REP 1")
 	require.NoError(t, err)
 
-	cnr := container.New(
-		container.WithPolicy(&policy),
-		container.WithCustomBasicACL(0x0FFFFFFF),
-		container.WithAttribute(container.AttributeTimestamp, strconv.FormatInt(time.Now().Unix(), 10)))
-	cnr.SetOwnerID(owner)
-	ver := version.Current()
-	cnr.SetVersion(&ver)
+	var cnr container.Container
+	cnr.Init()
+	cnr.SetPlacementPolicy(policy)
+	cnr.SetBasicACL(0x0FFFFFFF)
+	cnr.SetOwner(owner)
+
+	container.SetCreationTime(&cnr, time.Now())
 
 	var wp pool.WaitParams
 	wp.SetTimeout(30 * time.Second)
 	wp.SetPollInterval(3 * time.Second)
 
 	var prm pool.PrmContainerPut
-	prm.SetContainer(*cnr)
+	prm.SetContainer(cnr)
 
 	cnrID, err := clientPool.PutContainer(ctx, prm)
 	require.NoError(t, err)
 	fmt.Println(cnrID.EncodeToString())
 
-	return *cnrID
+	return cnrID
 }
